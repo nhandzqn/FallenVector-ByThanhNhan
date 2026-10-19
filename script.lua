@@ -1,5 +1,5 @@
 April = {
-    version = "4.3.6",
+    version = "5",
     debug = false,
     crash_logging = false,
     crash_trace = false,
@@ -10694,7 +10694,7 @@ local DIALOGUE_EN = {
 "greeting|roasty|smug|uncommon|Aww, you missed me? Cute. Don't die in the first minute.",
 "greeting|roasty|laugh|uncommon|I polished my smug face just for this session.",
 "greeting|roasty|evil|uncommon|If you survive ten minutes I might clap. Quietly.",
-"greeting|roasty|smug|rare|Cunzaki was here… and so am I. Try not to disgrace the brand.",
+"greeting|roasty|smug|rare|ThanhNhan was here… and so am I. Try not to disgrace the brand.",
 "greeting|roasty|laugh|rare|Secret greeting unlocked: please be slightly less chaotic.",
 "greeting|roasty|smug|mythic|Mythic hello. The stars aligned and still chose you. Wild.",
 "greeting|supportive|smug|common|April online. I'll keep an eye on you.",
@@ -10717,7 +10717,7 @@ local DIALOGUE_EN = {
 "greeting|supportive|disgusted|common|Hype but careful. That's the vibe.",
 "greeting|supportive|smug|uncommon|Little pep talk: hydrate, reload, and trust your ears.",
 "greeting|supportive|laugh|uncommon|You're not alone out there. I'm loud on purpose.",
-"greeting|supportive|smug|rare|Cunzaki was here — so play like the trailer.",
+"greeting|supportive|smug|rare|ThanhNhan was here — so play like the trailer.",
 "greeting|supportive|smug|mythic|Mythic cheer unlocked. Today feels lucky. Don't waste it.",
 "death|roasty|smug|common|You suck, lol. Want to try that again?",
 "death|roasty|laugh|common|That was your plan? Seriously?",
@@ -10774,8 +10774,8 @@ local DIALOGUE_EN = {
 "death|roasty|smug|uncommon|Aww, you died cute. Still dead though.",
 "death|roasty|laugh|uncommon|Tragic but aesthetic. Don't make it a brand.",
 "death|supportive|smug|uncommon|Gentle nudge: that was a hard fight. You've got the next.",
-"death|roasty|smug|rare|Cunzaki was here… watching that death. Ouch.",
-"death|supportive|smug|rare|Rare comfort: even Cunzaki wipes sometimes. Reset soft.",
+"death|roasty|smug|rare|ThanhNhan was here… watching that death. Ouch.",
+"death|supportive|smug|rare|Rare comfort: even ThanhNhan wipes sometimes. Reset soft.",
 "respawn|roasty|smug|common|Back already? Try keeping this body for a minute.",
 "respawn|roasty|laugh|common|New life, same questionable decision-making.",
 "respawn|roasty|evil|common|Round two. Surely nothing could go wrong.",
@@ -10814,7 +10814,7 @@ local DIALOGUE_EN = {
 "respawn|supportive|disgusted|common|Back with you. One play at a time.",
 "respawn|roasty|smug|uncommon|Cute respawn. Try a cute survival next.",
 "respawn|supportive|smug|uncommon|Aww, new life. I'm rooting for a longer one.",
-"respawn|roasty|smug|rare|Cunzaki was here — don't waste the respawn.",
+"respawn|roasty|smug|rare|ThanhNhan was here — don't waste the respawn.",
 "downed|roasty|smug|common|Floor inspection going well?",
 "downed|roasty|laugh|common|You found the downed state. Very thorough testing.",
 "downed|roasty|evil|common|Crawling is not a combat strategy.",
@@ -10905,7 +10905,7 @@ local DIALOGUE_EN = {
 "low_health|supportive|evil|common|Heal window. Take it.",
 "low_health|supportive|pout|common|Critical. I'm worried in a helpful way.",
 "low_health|supportive|smug|uncommon|Aww, you're hurt. Let's fix that gently.",
-"low_health|roasty|smug|rare|Cunzaki was here — and even he would heal.",
+"low_health|roasty|smug|rare|ThanhNhan was here — and even he would heal.",
 "recovered|roasty|smug|common|Health restored. Common sense still pending.",
 "recovered|roasty|laugh|common|Patched up and ready to make new mistakes.",
 "recovered|roasty|evil|common|Look at that, you discovered healing.",
@@ -11011,7 +11011,7 @@ local DIALOGUE_EN = {
 "combat_enter|supportive|evil|common|Stay composed. You've got answers.",
 "combat_enter|supportive|pout|common|Combat start. I'm with you.",
 "combat_enter|supportive|smug|uncommon|Aww, fight time. You've got cute courage. Use cover too.",
-"combat_enter|roasty|smug|rare|Cunzaki was here — win this clean.",
+"combat_enter|roasty|smug|rare|ThanhNhan was here — win this clean.",
 "combat_leave|roasty|smug|common|Combat over. Somehow you're still breathing.",
 "combat_leave|roasty|laugh|common|Fight ended. Hide your celebration.",
 "combat_leave|roasty|evil|common|Out of combat. Don't immediately dive back in.",
@@ -11250,7 +11250,7 @@ local DIALOGUE_EN = {
 "enemy_nearby|supportive|disgusted|common|Close threat. I'm with you.",
 "enemy_nearby|roasty|smug|uncommon|Aww, a visitor. Make them regret the doorbell.",
 "enemy_nearby|supportive|smug|uncommon|Cute tension. Stay calm — you've practiced this.",
-"enemy_nearby|roasty|smug|rare|Cunzaki was here — clear the nearby first.",
+"enemy_nearby|roasty|smug|rare|ThanhNhan was here — clear the nearby first.",
 "party_join|roasty|smug|common|You're in a party. Try not to drag them down.",
 "party_join|roasty|laugh|common|Teammates acquired. Their mistake.",
 "party_join|roasty|evil|common|Party up. Share loot like an adult.",
@@ -11370,7 +11370,7 @@ local DIALOGUE_RU = {
 "greeting|roasty|smug|uncommon|Aww, ty missed me? Cute. Ne die in the first minute.",
 "greeting|roasty|laugh|uncommon|Ya polished my smug face just for this session.",
 "greeting|roasty|evil|uncommon|If ty survive ten minutes Ya might clap. Quietly.",
-"greeting|roasty|smug|rare|Cunzaki was here… and so am Ya. Try not to disgrace the brand.",
+"greeting|roasty|smug|rare|ThanhNhan was here… and so am Ya. Try not to disgrace the brand.",
 "greeting|roasty|laugh|rare|Secret greeting unlocked: pozhaluysta be slightly less chaotic.",
 "greeting|roasty|smug|mythic|Mythic hello. The stars aligned and still chose ty. Wild.",
 "greeting|supportive|smug|common|April online. Ya'll keep an eye on ty.",
@@ -11393,7 +11393,7 @@ local DIALOGUE_RU = {
 "greeting|supportive|disgusted|common|Hype but careful. That's the vibe.",
 "greeting|supportive|smug|uncommon|Little pep talk: hydrate, reload, and trust tvoy ears.",
 "greeting|supportive|laugh|uncommon|Ty not alone out there. Ya loud on purpose.",
-"greeting|supportive|smug|rare|Cunzaki was here — so play like the trailer.",
+"greeting|supportive|smug|rare|ThanhNhan was here — so play like the trailer.",
 "greeting|supportive|smug|mythic|Mythic cheer unlocked. Today feels lucky. Ne waste it.",
 "death|roasty|smug|common|Ty suck, lol. Want to try that again?",
 "death|roasty|laugh|common|That was tvoy plan? Seriously?",
@@ -11450,8 +11450,8 @@ local DIALOGUE_RU = {
 "death|roasty|smug|uncommon|Aww, ty died cute. Still dead though.",
 "death|roasty|laugh|uncommon|Tragic but aesthetic. Ne make it a brand.",
 "death|supportive|smug|uncommon|Gentle nudge: that was a hard fight. Ty've got the next.",
-"death|roasty|smug|rare|Cunzaki was here… watching that death. Ouch.",
-"death|supportive|smug|rare|Rare comfort: even Cunzaki wipes sometimes. Reset soft.",
+"death|roasty|smug|rare|ThanhNhan was here… watching that death. Ouch.",
+"death|supportive|smug|rare|Rare comfort: even ThanhNhan wipes sometimes. Reset soft.",
 "respawn|roasty|smug|common|Back already? Try keeping this body for a minute.",
 "respawn|roasty|laugh|common|New life, same questionable decision-making.",
 "respawn|roasty|evil|common|Round two. Surely nothing could go wrong.",
@@ -11490,7 +11490,7 @@ local DIALOGUE_RU = {
 "respawn|supportive|disgusted|common|Back with ty. One play at a time.",
 "respawn|roasty|smug|uncommon|Cute respawn. Try a cute survival next.",
 "respawn|supportive|smug|uncommon|Aww, new life. Ya rooting for a longer one.",
-"respawn|roasty|smug|rare|Cunzaki was here — ne waste the respawn.",
+"respawn|roasty|smug|rare|ThanhNhan was here — ne waste the respawn.",
 "downed|roasty|smug|common|Floor inspection going well?",
 "downed|roasty|laugh|common|Ty found the downed state. Very thorough testing.",
 "downed|roasty|evil|common|Crawling is not a combat strategy.",
@@ -11581,7 +11581,7 @@ local DIALOGUE_RU = {
 "low_health|supportive|evil|common|Heal window. Take it.",
 "low_health|supportive|pout|common|Critical. Ya worried in a helpful way.",
 "low_health|supportive|smug|uncommon|Aww, ty're hurt. Let's fix that gently.",
-"low_health|roasty|smug|rare|Cunzaki was here — and even he would heal.",
+"low_health|roasty|smug|rare|ThanhNhan was here — and even he would heal.",
 "recovered|roasty|smug|common|Health restored. Common sense still pending.",
 "recovered|roasty|laugh|common|Patched up and ready to make new mistakes.",
 "recovered|roasty|evil|common|Look at that, ty discovered healing.",
@@ -11687,7 +11687,7 @@ local DIALOGUE_RU = {
 "combat_enter|supportive|evil|common|Stay composed. Ty've got answers.",
 "combat_enter|supportive|pout|common|Combat start. Ya with ty.",
 "combat_enter|supportive|smug|uncommon|Aww, fight time. Ty've got cute courage. Use cover too.",
-"combat_enter|roasty|smug|rare|Cunzaki was here — win this clean.",
+"combat_enter|roasty|smug|rare|ThanhNhan was here — win this clean.",
 "combat_leave|roasty|smug|common|Combat over. Somehow ty're still breathing.",
 "combat_leave|roasty|laugh|common|Fight ended. Hide tvoy celebration.",
 "combat_leave|roasty|evil|common|Out of combat. Ne immediately dive back in.",
@@ -11926,7 +11926,7 @@ local DIALOGUE_RU = {
 "enemy_nearby|supportive|disgusted|common|Close threat. Ya with ty.",
 "enemy_nearby|roasty|smug|uncommon|Aww, a visitor. Make them regret the doorbell.",
 "enemy_nearby|supportive|smug|uncommon|Cute tension. Stay calm — ty've practiced this.",
-"enemy_nearby|roasty|smug|rare|Cunzaki was here — clear the nearby first.",
+"enemy_nearby|roasty|smug|rare|ThanhNhan was here — clear the nearby first.",
 "party_join|roasty|smug|common|Ty in a party. Try not to drag them down.",
 "party_join|roasty|laugh|common|Teammates acquired. Their mistake.",
 "party_join|roasty|evil|common|Party up. Share loot like an adult.",
@@ -25764,7 +25764,7 @@ local STRINGS = {
     ["Copy Color"] = "Kopirovat tsvet",
     ["Paste Color"] = "Vstavit tsvet",
     ["None"] = "Net",
-    ["Made by Cunzaki"] = "Sdelano Cunzaki",
+    ["Made by ThanhNhan"] = "Sdelano ThanhNhan",
     ["Search features, modules, settings..."] = "Poisk funktsiy, moduley, nastroek...",
     ["Type to search every feature and module"] = "Vvedite tekst dlya poiska funktsiy i moduley",
     ["No matching features or modules"] = "Sovpadeniy ne naydeno",
@@ -30429,9 +30429,9 @@ function M.draw()
     local author_x = center_x + (1 - author_t) * math.min(125, width * 0.12)
     local title_size = math.max(40, math.floor(54 * (theme.SCALE or 1)))
     local author_size = math.max(15, math.floor(18 * (theme.SCALE or 1)))
-    draw_wave("April.lua", title_x, center_y - 38, title_size, title_alpha, 0, 1.35)
+    draw_wave("ThanhNhan in Fallen", title_x, center_y - 38, title_size, title_alpha, 0, 1.35)
     local i18n = April.require("ui.i18n")
-    draw_wave(i18n.t("Made by Cunzaki"), author_x, center_y + 22, author_size, author_alpha, 1.7, 0.8)
+    draw_wave(i18n.t("Made by ThanhNhan"), author_x, center_y + 22, author_size, author_alpha, 1.7, 0.8)
     draw_module_status(center_x, center_y + 62, elapsed, author_alpha)
     if profile_alpha > 0.01 then
         local final_w = math.max(230, math.min(420, math.floor(math.min(width, height) * 0.50)))
@@ -30534,7 +30534,7 @@ end
 return cursor_x
 end
 local function draw_brand(x, y)
-draw_wave_text("April.lua", x, y, theme.FONT_BRAND or 15)
+draw_wave_text("ThanhNhan in Fallen", x, y, theme.FONT_BRAND or 15)
 end
 local function clamp_window()
 local sw, sh = screen_size()
@@ -31165,7 +31165,7 @@ local version_text = "v" .. tostring(April.version or "")
 widgets.text(x + w - 14 - text_width(version_text, theme.FONT_CAPTION), y + 5,
 version_text, theme.TEXT_DIM, theme.FONT_CAPTION)
 local i18n = April.require("ui.i18n")
-local author_text = i18n.t("Made by Cunzaki")
+local author_text = i18n.t("Made by ThanhNhan")
 local author_size = math.max(8, (theme.FONT_CAPTION or 11) - 2)
 draw_wave_text(
 author_text,
