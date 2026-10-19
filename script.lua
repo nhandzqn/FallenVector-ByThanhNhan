@@ -16139,7 +16139,11 @@ local style = math.floor(tonumber(settings.num(PREFIX .. "smooth_type", 0)) or 0
 if style == SMOOTH_ADAPTIVE or style == SMOOTH_EXPONENTIAL then
 smooth_frames = math.max(1, math.floor(smooth_frames * 0.75))
 end
+local ok_r, rcs = pcall(April.require, "features.combat.recoil_control")
+local pre_p, pre_y = nil, nil
+if ok_r and rcs then pre_p, pre_y = rcs.angles() end
 pcall(camera.look_at, smoothed_aim.x, smoothed_aim.y, smoothed_aim.z, smooth_frames)
+if ok_r and rcs then rcs.script_move(pre_p, pre_y) end
 end
 else
 smoothed_aim = nil
@@ -16196,6 +16200,279 @@ draw_util.line(cx, cy, tx, ty, col, 1.5)
 end
 end
 end
+end
+return M
+end)()
+
+April._mods["features.combat.recoil_control"] = (function()
+-- Recoil Control: while you fire a gun, cancels recoil and nothing else.
+--   camera movement - your mouse movement - script turns (aimbot) = recoil
+-- Your mouse movement is read from the cursor (pixels) and converted to degrees with a
+-- sensitivity the script learns by itself while you are not shooting, so you can move the
+-- mouse freely in any direction while it is on. Fallen's recoil climbs every frame of a
+-- spray (no pauses, no settle-back), so each frame's recoil is undone right away.
+-- Camera-only (the same camera.look_at the aimbot uses); no GC, no gun or memory edits.
+local settings = April.require("core.settings")
+local menu_util = April.require("core.menu_util")
+local M = {}
+local LMB = 0x01
+local AFTER_FIRE_MS = 150      -- last kicks can land just after you let go
+local MAX_RECOIL_DEG = 20      -- more than this in one frame is not recoil (respawn, teleport)
+local CURSOR_JUMP_PX = 200     -- cursor jumping this far in one tick = recentered, not you
+local EDGE_PX = 2              -- cursor stuck on a screen edge cannot show movement that way
+local SIDE_PASS_DEG = 1.5      -- fallback only (cursor blind): bigger sideways steps are you
+local CAL_WINDOW_MS = 120
+local CAL_MIN_PX = 15
+local GUN_SCAN_MS = 200
+local GUN_EXTRA = {
+    ["Nail Gun"] = true, ["Bruno's M4A1"] = true, ["Crossbow"] = true,
+    ["Wooden Bow"] = true, ["Pumpkin Launcher"] = true,
+}
+local NOT_GUN = { ["Salvaged Shovel"] = true }
+-- Degrees per cursor pixel (measured in Fallen: ~0.1 sideways, ~0.08 vertical, cursor down =
+-- camera down). Re-learned continuously while you are not shooting.
+local st = {
+    prev_p = nil, prev_y = nil, fire_end = 0, mul = 1, next_roll = 0,
+    gun = nil, gun_at = -GUN_SCAN_MS,
+    cur_x = nil, cur_y = nil, ux = 0, uy = 0, blind_x = false, blind_y = false,
+    sens_x = 0.1, sens_y = -0.08,
+    cal_t = 0, cal_ux = 0, cal_uy = 0, cal_dx = 0, cal_dy = 0, cal_dirty = false,
+}
+local pending_p, pending_y = 0, 0
+local function now_ms()
+    local fn = utility and (utility.get_tick_count or utility.GetTickCount)
+    if type(fn) ~= "function" then return 0 end
+    local ok, v = pcall(fn)
+    return ok and tonumber(v) or 0
+end
+local function key_down(vk)
+    local fn = input and (input.is_key_down or input.IsKeyDown)
+    if type(fn) ~= "function" then return false end
+    local ok, v = pcall(fn, vk)
+    return ok and v == true
+end
+local function wrap(d)
+    while d > 180 do d = d - 360 end
+    while d < -180 do d = d + 360 end
+    return d
+end
+local function menu_open()
+    local ok, ui = pcall(function() return April.require("ui.custom_menu") end)
+    return ok and ui and ui.is_open and ui.is_open() == true
+end
+local function read_cursor()
+    local fn = input and (input.GetMousePosition or input.get_mouse_position)
+    if type(fn) == "function" then
+        local ok, x, y = pcall(fn)
+        if ok and tonumber(x) then return tonumber(x), tonumber(y) end
+    end
+    fn = utility and (utility.GetMousePos or utility.get_mouse_pos)
+    if type(fn) == "function" then
+        local ok, x, y = pcall(fn)
+        if ok and tonumber(x) then return tonumber(x), tonumber(y) end
+    end
+    return nil
+end
+local function screen_size()
+    local fn = (draw and (draw.GetScreenSize or draw.get_screen_size))
+        or (utility and (utility.GetScreenSize or utility.get_screen_size))
+    if type(fn) == "function" then
+        local ok, w, h = pcall(fn)
+        if ok and tonumber(w) then return tonumber(w), tonumber(h) end
+    end
+    return nil
+end
+-- Camera pitch / yaw in degrees.
+function M.angles()
+    local fn = camera and (camera.get_look_vector or camera.GetLookVector)
+    if type(fn) ~= "function" then return nil end
+    local ok, v = pcall(fn)
+    if not ok or not v then return nil end
+    local x, y, z = v.X or v.x, v.Y or v.y, v.Z or v.z
+    if not x then return nil end
+    local p = math.deg(math.asin(math.max(-1, math.min(1, y))))
+    return p, math.deg(math.atan2(x, -z))
+end
+-- Other features call this right after they turn the camera (pre = angles before the turn),
+-- so that turn is not mistaken for recoil.
+function M.script_move(pre_p, pre_y)
+    if not pre_p then return end
+    local p, y = M.angles()
+    if not p then return end
+    pending_p = pending_p + (p - pre_p)
+    pending_y = pending_y + wrap(y - pre_y)
+    st.cal_dirty = true
+end
+local function is_gun(name)
+    if type(name) ~= "string" or NOT_GUN[name] then return false end
+    if GUN_EXTRA[name] then return true end
+    return name:find("^Salvaged ") ~= nil or name:find("^Military ") ~= nil
+end
+local function find_held_gun()
+    local lp = game.LocalPlayer or game.local_player
+    local char = nil
+    pcall(function() char = lp and lp.Character end)
+    if char then
+        local ok, kids = pcall(function() return char:GetChildren() end)
+        if ok and kids then
+            for i = 1, #kids do
+                local n = nil
+                pcall(function() n = kids[i].Name end)
+                if is_gun(n) then return n end
+            end
+        end
+    end
+    local vms = nil
+    pcall(function() vms = game.Workspace:FindFirstChild("Viewmodels") end)
+    if vms then
+        local ok, list = pcall(function() return vms:GetChildren() end)
+        if ok and list then
+            for i = 1, #list do
+                local ok2, items = pcall(function() return list[i]:GetChildren() end)
+                if ok2 and items then
+                    for j = 1, #items do
+                        local n = nil
+                        pcall(function() n = items[j].Name end)
+                        if is_gun(n) then return n end
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+local function held_gun(now)
+    if now - st.gun_at >= GUN_SCAN_MS then
+        st.gun_at = now
+        st.gun = find_held_gun()
+    end
+    return st.gun
+end
+local function turn_to(p, y)
+    local pos_fn = camera and (camera.get_position or camera.GetPosition)
+    local look = camera and (camera.look_at or camera.LookAt)
+    if type(pos_fn) ~= "function" or type(look) ~= "function" then return false end
+    local ok, c = pcall(pos_fn)
+    if not ok or not c then return false end
+    local cx, cy, cz = c.X or c.x, c.Y or c.y, c.Z or c.z
+    if not cx then return false end
+    local rp, ry = math.rad(math.max(-89, math.min(89, p))), math.rad(y)
+    local dx = math.cos(rp) * math.sin(ry)
+    local dy = math.sin(rp)
+    local dz = -math.cos(rp) * math.cos(ry)
+    return pcall(look, cx + dx * 100, cy + dy * 100, cz + dz * 100, 1)
+end
+-- Adds the cursor movement since the last tick to ux / uy (pixels).
+local function track_cursor()
+    local x, y = read_cursor()
+    if not x then
+        st.cur_x, st.blind_x, st.blind_y = nil, true, true
+        return
+    end
+    if st.cur_x then
+        local dx, dy = x - st.cur_x, y - st.cur_y
+        if math.abs(dx) < CURSOR_JUMP_PX and math.abs(dy) < CURSOR_JUMP_PX then
+            st.ux, st.uy = st.ux + dx, st.uy + dy
+        end
+    end
+    st.cur_x, st.cur_y = x, y
+    local sw, sh = screen_size()
+    if sw then
+        st.blind_x = x <= EDGE_PX or x >= sw - 1 - EDGE_PX
+        st.blind_y = y <= EDGE_PX or y >= sh - 1 - EDGE_PX
+    else
+        st.blind_x, st.blind_y = false, false
+    end
+end
+-- Learns degrees-per-pixel from your normal mouse movement while you are not shooting.
+local function calibrate(now, dp, dy)
+    st.cal_ux, st.cal_uy = st.cal_ux + st.ux, st.cal_uy + st.uy
+    st.cal_dx, st.cal_dy = st.cal_dx + dy, st.cal_dy + dp
+    if now - st.cal_t < CAL_WINDOW_MS then return end
+    if not st.cal_dirty and not st.blind_x and math.abs(st.cal_ux) >= CAL_MIN_PX then
+        local r = st.cal_dx / st.cal_ux
+        if r > 0.005 and r < 1 then st.sens_x = st.sens_x * 0.8 + r * 0.2 end
+    end
+    if not st.cal_dirty and not st.blind_y and math.abs(st.cal_uy) >= CAL_MIN_PX then
+        local r = st.cal_dy / st.cal_uy
+        if r < -0.005 and r > -1 then st.sens_y = st.sens_y * 0.8 + r * 0.2 end
+    end
+    st.cal_t, st.cal_ux, st.cal_uy, st.cal_dx, st.cal_dy, st.cal_dirty = now, 0, 0, 0, 0, false
+end
+function M.register_menu()
+    local G = menu_util.G
+    local T = menu_util.group(G.AIM)
+    menu_util.register_keybind(T, G.AIM, "april_rcs_enabled", "Recoil Control", false)
+end
+function M.update(_dt) end
+function M.draw()
+    local now = now_ms()
+    local on = settings.enabled("april_rcs_enabled") and not menu_open()
+    if not on then
+        st.prev_p, st.cur_x, st.ux, st.uy = nil, nil, 0, 0
+        pending_p, pending_y = 0, 0
+        return
+    end
+    if key_down(LMB) and held_gun(now) then st.fire_end = now + AFTER_FIRE_MS end
+    track_cursor()
+    local p, y = M.angles()
+    if not p then return end
+    if not st.prev_p then
+        st.prev_p, st.prev_y, st.ux, st.uy = p, y, 0, 0
+        pending_p, pending_y = 0, 0
+        return
+    end
+    local dp = (p - st.prev_p) - pending_p
+    local dy = wrap(y - st.prev_y) - pending_y
+    -- The game moves the camera once per rendered frame; keep collecting cursor movement
+    -- until it does, so both are compared over the same frame.
+    if math.abs(dp) < 1e-4 and math.abs(dy) < 1e-4 then return end
+    pending_p, pending_y = 0, 0
+    if now > st.fire_end then
+        calibrate(now, dp, dy)
+        st.prev_p, st.prev_y, st.ux, st.uy = p, y, 0, 0
+        return
+    end
+    -- What is left after taking out your own mouse movement is recoil.
+    local rp = dp - st.uy * st.sens_y
+    local ry = dy - st.ux * st.sens_x
+    st.ux, st.uy = 0, 0
+    if math.abs(rp) > MAX_RECOIL_DEG or math.abs(ry) > MAX_RECOIL_DEG then
+        st.prev_p, st.prev_y = p, y
+        return
+    end
+    local strength = math.max(0, math.min(100, settings.num("april_rcs_strength", 100))) / 100
+    -- Humanize %: every 0.3-0.7s the strength is lowered by a random amount, so some
+    -- recoil stays like a real player's. 0% = never, 100% = keeps 3% to 40% of the recoil.
+    local hz = math.max(0, math.min(100, settings.num("april_rcs_humanize_pct", 40))) / 100
+    if hz > 0 then
+        if now >= st.next_roll then
+            st.next_roll = now + 300 + math.random() * 400
+            st.roll = 0.03 + math.random() * 0.37
+        end
+        strength = strength * (1 - hz * (st.roll or 0.2))
+    end
+    local fix_p, fix_y
+    if st.blind_y then
+        -- Cursor pinned to a screen edge: fall back to undoing upward movement only.
+        fix_p = dp > 0 and -dp * strength or 0
+    else
+        fix_p = -rp * strength
+    end
+    if not settings.bool("april_rcs_sideways", true) then
+        fix_y = 0
+    elseif st.blind_x then
+        fix_y = math.abs(dy) <= SIDE_PASS_DEG and -dy * strength or 0
+    else
+        fix_y = -ry * strength
+    end
+    if math.abs(fix_p) + math.abs(fix_y) < 0.002 then
+        st.prev_p, st.prev_y = p, y
+        return
+    end
+    turn_to(p + fix_p, y + fix_y)
+    local np, ny = M.angles()
+    st.prev_p, st.prev_y = np or (p + fix_p), ny or (y + fix_y)
 end
 return M
 end)()
@@ -25874,6 +26151,11 @@ local STRINGS = {
     ["Adaptive"] = "Adaptivnyy",
     ["Humanize"] = "Humanizatsiya",
     ["Humanize Strength"] = "Sila humanizatsii",
+    ["Recoil Control"] = "Kontrol otdachi",
+    ["Strength %"] = "Sila %",
+    ["Sideways Control"] = "Bokovoy kontrol",
+    ["Humanize %"] = "Gumanizatsiya %",
+    ["Cancels recoil only. Move your mouse freely; it learns your sensitivity."] = "Ubiraet tolko otdachu. Dvigayte mysh svobodno; chuvstvitelnost opredelyaetsya avtomaticheski.",
     ["FOV Radius (px)"] = "Radius FOV (px)",
     ["FOV Circle"] = "Krug FOV",
     ["FOV Style"] = "Stil FOV",
@@ -26273,6 +26555,10 @@ local TIPS = {
     april_aim_humanize_str = "Naskolko silny dreyf i perelet humanizatsii.",
     april_aim_whitelist_ids = "Roblox user ID cherez zapyatuyu, kotoryh aimbot obyazan ignorirovat. Snachala vklyuchite Whitelist v Filters. Takzhe mozhno middle-click po tekuschey tseli igroka, chtoby dobavit/ubrat.",
     april_aim_bone = "Kakuyu chast tela trekaet aimbot. Randomized Part perebrasyvaet kazhdyy vystrel pri zazhatom Mouse 1.",
+    april_rcs_enabled = "Poka vy strelyaete, ubiraet tolko otdachu. Dvizhenie myshi vsegda prohodit, poetomu mozhno tselitsya svobodno. Tolko kamera, bez GC.",
+    april_rcs_strength = "Naskolko ubirat otdachu. 100% = pochti bez otdachi.",
+    april_rcs_sideways = "Takzhe ubiraet bokovuyu otdachu vlevo/vpravo, a ne tolko podbros vverh.",
+    april_rcs_humanize_pct = "Naskolko estestvenno vyglyadit kontrol. 0% = ubiraet vsyu otdachu, 100% = ostavlyaet sluchaynye 3-40% otdachi, menyayas kazhdye 0.3-0.7 sek.",
     april_player_enabled = "Pokazyvaet boksy i informatsiyu na drugih igrokah.",
     april_ui_player_elements = "Vyberite, kakuyu informatsiyu pokazyvat na ESP igrokov.",
     april_player_show_held = "Pokazyvaet predmet v rukah igroka (tot zhe put chteniya, chto u Target Gear).",
@@ -26616,6 +26902,10 @@ april_aim_humanize = "Adds light drift and overshoot so mouse aim feels less rob
 april_aim_humanize_str = "How strong humanize drift and overshoot are.",
 april_aim_whitelist_ids = "Comma-separated Roblox user IDs that Aimbot must ignore. Enable Whitelist inside Filters first. You can also middle-click the current player target to add or remove them.",
 april_aim_bone = "Which body part the aimbot tracks. Randomized Part re-rolls every shot while holding Mouse 1.",
+april_rcs_enabled = "While you fire a gun, cancels recoil only. Your own mouse movement always goes through, so you can aim freely. Camera only, no GC.",
+april_rcs_strength = "How much recoil to remove. 100% = close to no recoil.",
+april_rcs_sideways = "Also cancels the left and right recoil, not just the climb.",
+april_rcs_humanize_pct = "How human the control looks. 0% = removes all recoil, 100% = leaves a random 3% to 40% of the recoil, changing every 0.3 to 0.7 seconds.",
 april_player_enabled = "Shows boxes and info on other players.",
 april_ui_player_elements = "Choose which info to show on player ESP.",
 april_player_show_held = "Shows the item a player is holding (same read path as Target Gear).",
@@ -29058,7 +29348,18 @@ cb("april_fov_flags_visible", "Visible Flag", true, nil, "april_fov_flags_enable
 cb("april_fov_flags_distance", "Distance Flag", true, nil, "april_fov_flags_enabled"),
 },
 }
-return { regular, fov_flags }
+local R = "april_rcs_enabled"
+local recoil = {
+title = "Recoil Control",
+items = {
+kb("april_rcs_enabled", "Recoil Control", false),
+sl("april_rcs_strength", "Strength %", 0, 100, 100, false, R),
+cb("april_rcs_sideways", "Sideways Control", true, nil, R),
+sl("april_rcs_humanize_pct", "Humanize %", 0, 100, 40, false, R),
+I.label("Cancels recoil only. Move your mouse freely; it learns your sensitivity.", true, R),
+},
+}
+return { regular, fov_flags, recoil }
 end
 return M
 end)()
@@ -31263,6 +31564,7 @@ M._update_dispatch = {}
 M._draw_dispatch = {}
 M.FEATURE_ORDER = {
     "features.combat.camera_aimbot",
+    "features.combat.recoil_control",
     "features.combat.fov_flags",
     "features.visuals.target_overlay",
     "features.visuals.target_visuals",
