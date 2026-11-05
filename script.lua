@@ -2087,6 +2087,13 @@ local function ensure_draw_aliases()
     end)
     _aliases_ready = true
 end
+-- Filled FOV circle when the feature's Fill FOV toggle (id) is on; drawn under the outline.
+function M.fill_fov(id, x, y, r, default_col)
+    local settings = April.require("core.settings")
+    if not settings.bool(id, false) then return end
+    local fn = draw and (draw.circle_filled or draw.CircleFilled)
+    if type(fn) == "function" then pcall(fn, x, y, r, settings.color(id, default_col), 64) end
+end
 function M.white(r, g, b, a)
     return { r or 1, g or 1, b or 1, a or 1 }
 end
@@ -5141,16 +5148,21 @@ local DEFAULT_TASK = {
 local DEFAULT_MISC = {
     AnimationId = 192,
 }
+local DEFAULT_BASE_PART = {
+    Transparency = 280,
+}
 local sound = {}
 local anim_track = {}
 local animator = {}
 local task_sched = {}
 local misc = {}
+local base_part = {}
 for k, v in pairs(DEFAULT_SOUND) do sound[k] = v end
 for k, v in pairs(DEFAULT_ANIM_TRACK) do anim_track[k] = v end
 for k, v in pairs(DEFAULT_ANIMATOR) do animator[k] = v end
 for k, v in pairs(DEFAULT_TASK) do task_sched[k] = v end
 for k, v in pairs(DEFAULT_MISC) do misc[k] = v end
+for k, v in pairs(DEFAULT_BASE_PART) do base_part[k] = v end
 local fetched = false
 local fetch_ok = false
 local booted = false
@@ -5221,6 +5233,7 @@ function M.fetch(force)
     apply_block(body, "Animator", animator, nil)
     apply_block(body, "TaskScheduler", task_sched, nil)
     apply_block(body, "Misc", misc, nil)
+    apply_block(body, "BasePart", base_part, nil)
     if not ok_sound then
         local match = body:match('"IsPlaying"%s*:%s*(%d+)')
         if match then
@@ -5364,6 +5377,10 @@ function M.apply_max_fps(target)
     fps_fail_streak = fps_fail_streak + 1
     if fps_fail_streak >= 5 then fps_disabled = true end
     return false
+end
+-- Offset of a BasePart property (live list, built-in fallback).
+function M.base_part(field)
+    return base_part[field]
 end
 function M.boot()
     if booted then return fetch_ok end
@@ -6219,6 +6236,306 @@ end
 return M
 end)()
 
+April._mods["core.clipboard"] = (function()
+local M = {}
+local WRITE_NAMES = {
+    "setclipboard", "toclipboard", "writeclipboard", "copyclipboard",
+    "SetClipboard", "ToClipboard", "WriteClipboard", "CopyClipboard",
+    "set_clipboard", "clipboard_set", "ClipboardSet", "write_clipboard", "clipboard_write",
+    "copy_clipboard", "clipboard_copy", "CopyToClipboard", "copyToClipboard",
+    "setClipboard", "toClipboard", "writeClipboard",
+}
+local READ_NAMES = {
+    "getclipboard", "readclipboard", "fromclipboard",
+    "GetClipboard", "ReadClipboard", "FromClipboard",
+    "get_clipboard", "clipboard_get", "ClipboardGet", "read_clipboard", "clipboard_read",
+    "getClipboard", "readClipboard", "fromClipboard",
+}
+local NAMESPACES = { "syn", "fluxus", "krnl", "Krnl", "ScriptWare", "electron", "executor", "bridge", "utility" }
+local WRITE_GETTERS = {
+    { "setclipboard", function() return setclipboard end },
+    { "toclipboard", function() return toclipboard end },
+    { "writeclipboard", function() return writeclipboard end },
+    { "SetClipboard", function() return SetClipboard end },
+    { "ToClipboard", function() return ToClipboard end },
+    { "WriteClipboard", function() return WriteClipboard end },
+    { "setClipboard", function() return setClipboard end },
+    { "writeClipboard", function() return writeClipboard end },
+    { "write_clipboard", function() return write_clipboard end },
+    { "clipboard_write", function() return clipboard_write end },
+    { "CopyToClipboard", function() return CopyToClipboard end },
+    { "copy_clipboard", function() return copy_clipboard end },
+    { "syn.setclipboard", function() return syn and syn.setclipboard end },
+    { "syn.clipboard_set", function() return syn and syn.clipboard_set end },
+    { "syn.set_clipboard", function() return syn and syn.set_clipboard end },
+    { "utility.SetClipboard", function() return utility and utility.SetClipboard end },
+    { "utility.CopyToClipboard", function() return utility and utility.CopyToClipboard end },
+    { "utility.set_clipboard", function() return utility and utility.set_clipboard end },
+    { "utility.clipboard_set", function() return utility and utility.clipboard_set end },
+}
+local READ_GETTERS = {
+    { "getclipboard", function() return getclipboard end },
+    { "readclipboard", function() return readclipboard end },
+    { "fromclipboard", function() return fromclipboard end },
+    { "GetClipboard", function() return GetClipboard end },
+    { "ReadClipboard", function() return ReadClipboard end },
+    { "getClipboard", function() return getClipboard end },
+    { "readClipboard", function() return readClipboard end },
+    { "get_clipboard", function() return get_clipboard end },
+    { "clipboard_get", function() return clipboard_get end },
+    { "read_clipboard", function() return read_clipboard end },
+    { "syn.getclipboard", function() return syn and syn.getclipboard end },
+    { "syn.clipboard_get", function() return syn and syn.clipboard_get end },
+    { "utility.GetClipboard", function() return utility and utility.GetClipboard end },
+    { "utility.get_clipboard", function() return utility and utility.get_clipboard end },
+    { "utility.clipboard_get", function() return utility and utility.clipboard_get end },
+}
+local function clean_text(text)
+    text = tostring(text or "")
+    text = text:gsub("\r\n", "\n"):gsub("\r", "\n")
+    text = text:gsub("%z", "")
+    return (text:gsub("^\239\187\191", ""))
+end
+local function normalize(text)
+    return (clean_text(text):gsub("%s+$", ""))
+end
+local function env_tables()
+    local envs, seen = {}, {}
+    local function add(env)
+        if type(env) ~= "table" or seen[env] then return end
+        seen[env] = true
+        envs[#envs + 1] = env
+    end
+    local ok_g, globals = pcall(function() return _G end)
+    if ok_g then add(globals) end
+    local ok_genv, genv_fn = pcall(function() return getgenv end)
+    if ok_genv and type(genv_fn) == "function" then
+        local ok, env = pcall(genv_fn)
+        if ok then add(env) end
+    end
+    local ok_fenv, fenv_fn = pcall(function() return getfenv end)
+    if ok_fenv and type(fenv_fn) == "function" then
+        for _, level in ipairs({ 0, 1 }) do
+            local ok, env = pcall(fenv_fn, level)
+            if ok then add(env) end
+        end
+    end
+    return envs
+end
+local function iter_candidates(getters, names, callback)
+    local seen = {}
+    local function try(fn, label)
+        if type(fn) ~= "function" or seen[fn] then return false end
+        seen[fn] = true
+        return callback(fn, label) == true
+    end
+    for i = 1, #getters do
+        local ok, fn = pcall(getters[i][2])
+        if ok and try(fn, getters[i][1]) then return true end
+    end
+    local envs = env_tables()
+    for ei = 1, #envs do
+        local env = envs[ei]
+        for ni = 1, #names do
+            local ok, fn = pcall(function() return env[names[ni]] end)
+            if ok and try(fn, names[ni]) then return true end
+        end
+        for si = 1, #NAMESPACES do
+            local ok, ns = pcall(function() return env[NAMESPACES[si]] end)
+            if ok and type(ns) == "table" then
+                for ni = 1, #names do
+                    local ok2, fn = pcall(function() return ns[names[ni]] end)
+                    if ok2 and try(fn, NAMESPACES[si] .. "." .. names[ni]) then return true end
+                end
+            end
+        end
+    end
+    return false
+end
+local function io_pipe_available()
+    return type(io) == "table" and type(io.popen) == "function"
+end
+local function pipe_write_raw(cmd, text)
+    if not io_pipe_available() then return false end
+    local ok, pipe = pcall(io.popen, cmd, "w")
+    if not ok or pipe == nil then return false end
+    local ok_write, wrote = pcall(function() return pipe:write(text) end)
+    if not ok_write or wrote == nil then
+        pcall(function() pipe:close() end)
+        return false
+    end
+    local ok_close, closed = pcall(function() return pipe:close() end)
+    return ok_close and closed == true
+end
+local function pipe_read(cmd)
+    if not io_pipe_available() then return nil end
+    local ok, pipe = pcall(io.popen, cmd, "r")
+    if not ok or pipe == nil then return nil end
+    local ok_read, text = pcall(function() return pipe:read("*a") end)
+    pcall(function() pipe:close() end)
+    if ok_read and type(text) == "string" and text ~= "" then return text end
+    return nil
+end
+local PS_READ_SCRIPT = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; [Console]::Out.Write((Get-Clipboard -Raw))"
+local PS_WRITE_SCRIPT = "$s=New-Object IO.StreamReader([Console]::OpenStandardInput(),[Text.Encoding]::UTF8); Set-Clipboard -Value $s.ReadToEnd()"
+local function ps_cmd(script)
+    return 'powershell -NoProfile -STA -Command "' .. script .. '"'
+end
+local function read_pipe_clipboard()
+    return pipe_read(ps_cmd(PS_READ_SCRIPT))
+end
+local function pipe_write(text)
+    if not io_pipe_available() then return false, nil end
+    local commands = {}
+    if not text:find("[\128-\255]") then
+        commands[#commands + 1] = { "clip", "clip" }
+    end
+    commands[#commands + 1] = { ps_cmd(PS_WRITE_SCRIPT), "powershell" }
+    for i = 1, #commands do
+        local cmd, label = commands[i][1], commands[i][2]
+        if pipe_write_raw(cmd, text) then
+            local back = read_pipe_clipboard()
+            if type(back) == "string" and normalize(back) == normalize(text) then
+                return true, label
+            end
+        end
+    end
+    return false, nil
+end
+local function clip_temp_paths()
+    local paths = {}
+    local ok, store = pcall(April.require, "core.config_store")
+    if ok and type(store) == "table" and type(store.get_config_path) == "function" then
+        local ok_path, path = pcall(store.get_config_path, "April_clipboard_tmp.txt")
+        if ok_path and type(path) == "string" and path ~= "" then paths[#paths + 1] = path end
+    end
+    if type(os) == "table" and type(os.tmpname) == "function" then
+        local ok_tmp, path = pcall(os.tmpname)
+        if ok_tmp and type(path) == "string" and path ~= "" then paths[#paths + 1] = path end
+    end
+    return paths
+end
+local function write_text_file(path, text)
+    if type(io) ~= "table" or type(io.open) ~= "function" then return false end
+    local ok, file = pcall(io.open, path, "w")
+    if not ok or file == nil then return false end
+    local ok_write, wrote = pcall(function() return file:write(text) end)
+    local ok_close, closed = pcall(function() return file:close() end)
+    return ok_write and ok_close and wrote ~= nil and closed ~= nil
+end
+local function execute_write(text)
+    if type(os) ~= "table" or type(os.execute) ~= "function" then return false end
+    local paths = clip_temp_paths()
+    for i = 1, #paths do
+        local path = paths[i]
+        if not path:find("'", 1, true) and write_text_file(path, text) then
+            local script = "Set-Clipboard -Value (Get-Content -Raw -Encoding UTF8 '" .. path .. "')"
+            local ok, res = pcall(os.execute, ps_cmd(script))
+            if type(os.remove) == "function" then pcall(os.remove, path) end
+            return ok and (res == true or res == 0)
+        end
+    end
+    return false
+end
+local function shell_read_via_execute()
+    if type(os) ~= "table" or type(os.execute) ~= "function" then return nil end
+    if type(io) ~= "table" or type(io.open) ~= "function" then return nil end
+    local paths = clip_temp_paths()
+    for i = 1, #paths do
+        local path = paths[i]
+        if not path:find("'", 1, true) then
+            if type(os.remove) == "function" then pcall(os.remove, path) end
+            local script = "$s=Get-Clipboard -Raw; if ($null -eq $s) { $s='' }; [IO.File]::WriteAllText('" .. path .. "', $s, [Text.Encoding]::UTF8)"
+            local ok, res = pcall(os.execute, ps_cmd(script))
+            if ok and (res == true or res == 0) then
+                local ok_open, file = pcall(io.open, path, "r")
+                if ok_open and file then
+                    local text = file:read("*a")
+                    file:close()
+                    if type(os.remove) == "function" then pcall(os.remove, path) end
+                    if type(text) == "string" then return text end
+                end
+            end
+        end
+    end
+    return nil
+end
+function M.write(text)
+    text = tostring(text or "")
+    if text == "" then return false, "empty" end
+    local probe = nil
+    iter_candidates(READ_GETTERS, READ_NAMES, function(fn, label)
+        probe = { fn = fn, label = label }
+        return true
+    end)
+    local shell_read_done, shell_read_text = false, nil
+    local function evidence(fresh)
+        if fresh then shell_read_done = false end
+        if probe then
+            local ok, res = pcall(probe.fn)
+            if ok and type(res) == "string" and res ~= "" then return res end
+        end
+        if io_pipe_available() then
+            local piped = read_pipe_clipboard()
+            if type(piped) == "string" and piped ~= "" then return piped end
+        end
+        if not shell_read_done then
+            shell_read_done = true
+            shell_read_text = shell_read_via_execute()
+        end
+        return shell_read_text
+    end
+    local function matches(back)
+        return type(back) == "string" and normalize(back) == normalize(text)
+    end
+    local verified, claimed = nil, nil
+    iter_candidates(WRITE_GETTERS, WRITE_NAMES, function(fn, label)
+        local ok, res = pcall(fn, text)
+        if not ok or res == false then return false end
+        if matches(evidence()) then
+            verified = label
+            return true
+        end
+        claimed = claimed or label
+        return false
+    end)
+    if verified then return true, verified end
+    local pipe_ok, pipe_label = pipe_write(text)
+    if pipe_ok then return true, pipe_label end
+    if execute_write(text) then
+        if matches(evidence(true)) then return true, "powershell" end
+        claimed = claimed or "powershell"
+    end
+    if claimed then return false, "unverified" end
+    return false, "unavailable"
+end
+function M.read()
+    local value, method = nil, nil
+    iter_candidates(READ_GETTERS, READ_NAMES, function(fn, label)
+        local ok, res = pcall(fn)
+        if ok and type(res) == "string" and res ~= "" then
+            value = clean_text(res)
+            method = label
+            return true
+        end
+        return false
+    end)
+    if value then return value, method end
+    local text = read_pipe_clipboard()
+    if type(text) == "string" then
+        text = clean_text(text)
+        if text ~= "" then return text, "powershell" end
+    end
+    local shell_text = shell_read_via_execute()
+    if type(shell_text) == "string" then
+        shell_text = clean_text(shell_text)
+        if shell_text ~= "" then return shell_text, "powershell" end
+    end
+    return nil, nil
+end
+return M
+end)()
+
 April._mods["core.config_store"] = (function()
 local cache = April.require("core.cache")
 local M = {}
@@ -6250,6 +6567,7 @@ local EXCLUDE = {
 }
 local MENU_KEYS = {
     "april_ui_russian",
+    "april_ui_language",
     "april_ui_theme_preset", "april_ui_window_opacity", "april_ui_panel_opacity",
     "april_ui_border_strength", "april_ui_corner_style", "april_ui_scale", "april_ui_density",
     "april_ui_menu_overlay", "april_ui_overlay_strength",
@@ -6278,16 +6596,10 @@ local MENU_KEYS = {
     "april_player_flag_movement", "april_player_flag_vip",
     "april_player_flag_cheater", "april_player_flag_animation",
     "april_player_esp_filters", "april_player_esp_flags",
+    "april_ui_player_elements",
     "april_player_range",
     "april_target_overlay", "april_target_overlay_fov", "april_target_overlay_max_dist",
     "april_target_overlay_gear_size", "april_target_overlay_top",
-    "april_crosshair_source",
-    "april_crosshair_enabled", "april_crosshair_type", "april_crosshair_size", "april_crosshair_gap",
-    "april_crosshair_thickness", "april_crosshair_color", "april_crosshair_dot", "april_crosshair_outline",
-    "april_crosshair_rainbow", "april_crosshair_rainbow_speed",
-    "april_crosshair_follow", "april_crosshair_follow_smooth",
-    "april_crosshair_spin", "april_crosshair_spin_speed",
-    "april_crosshair_pulse", "april_crosshair_pulse_speed",
     "april_aimbot", "april_aimbot_mode", "april_aim_key", "april_aim_key_mode",
     "april_aim_target_type", "april_aim_bone",
     "april_aim_filters", "april_aim_whitelist_ids",
@@ -6323,6 +6635,7 @@ local MENU_KEYS = {
     "april_npc_health",
     "april_npc_show_name", "april_npc_show_distance", "april_npc_range",
     "april_npc_tracers", "april_npc_offscreen",
+    "april_ui_npc_types", "april_ui_npc_elements",
     "april_raid_enabled", "april_raid_enabled_mode", "april_raid_notifications", "april_raid_range",
     "april_base_enabled", "april_base_enabled_mode", "april_base_cabinet", "april_storage_cabinet", "april_small_box", "april_large_box",
     "april_sleeping_bag", "april_auto_turret", "april_auto_turret_ring", "april_shotgun_turret", "april_shotgun_turret_ring",
@@ -6332,25 +6645,15 @@ local MENU_KEYS = {
     "april_small_battery", "april_medium_battery", "april_large_battery",
     "april_solar_panel", "april_windmill",
     "april_base_boxes", "april_base_show_name", "april_base_show_distance", "april_base_range",
+    "april_base_chams_enabled",
     "april_base_chams", "april_base_chams_mode", "april_base_chams_color",
     "april_base_xray_enabled", "april_base_xray_enabled_mode", "april_base_xray_range",
     "april_map_enabled", "april_map_enabled_mode", "april_map_zoom", "april_map_size",
     "april_map_opacity", "april_map_icon_scale",
     "april_map_show_players", "april_map_show_npcs", "april_map_show_loot", "april_map_show_world",
     "april_map_show_base", "april_map_show_raids",
+    "april_ui_radar_layers",
     "april_map_labels", "april_map_x", "april_map_y",
-    "april_fling_enabled", "april_fling_enabled_mode", "april_fling_fov", "april_fling_duration",
-    "april_desync_enabled", "april_desync_enabled_mode",
-    "april_desync_visualizer",
-    "april_antiaim_enabled", "april_antiaim_enabled_mode",
-    "april_antiaim_yaw_mode",
-    "april_antiaim_yaw_manual",
-    "april_antiaim_spin_speed",
-    "april_antiaim_jitter_step", "april_antiaim_jitter_ms",
-    "april_fakeduck_enabled", "april_fakeduck_enabled_mode",
-    "april_fakeduck_height",
-    "april_fakeduck_spam", "april_fakeduck_spam_mode",
-    "april_fakeduck_spam_min", "april_fakeduck_spam_max", "april_fakeduck_spam_ms",
     "april_keybinds_enabled", "april_keybinds_active_only", "april_keybinds_show_unbound", "april_keybinds_show_mode",
     "april_keybinds_x", "april_keybinds_y",
     "april_mod_checker_enabled", "april_mod_checker_interval",
@@ -6358,12 +6661,54 @@ local MENU_KEYS = {
     "april_event_status_enabled", "april_event_status_active_only", "april_event_status_notify",
     "april_event_status_distance", "april_event_status_health", "april_event_status_sort",
     "april_event_status_x", "april_event_status_y",
+    "april_aimbot_auto_weapon", "april_aimbot_auto_weapon_indicator", "april_aimbot_bone",
+    "april_aimbot_bullet_speed", "april_aimbot_draw_fov", "april_aimbot_drop_prediction",
+    "april_aimbot_drop_prediction_indicator", "april_aimbot_enabled", "april_aimbot_fov",
+    "april_aimbot_gravity", "april_aimbot_humanize", "april_aimbot_npc_mode",
+    "april_aimbot_npcs", "april_aimbot_player_mode", "april_aimbot_players",
+    "april_aimbot_prediction", "april_aimbot_prediction_indicator", "april_aimbot_rand_head",
+    "april_aimbot_rand_lower", "april_aimbot_rand_upper", "april_aimbot_smooth",
+    "april_aimbot_sticky", "april_aimbot_visible_only",
+    "april_silent_aim",
+    "april_silent_draw_fov", "april_silent_fov", "april_silent_hit_chance",
+    "april_silent_max_dist", "april_silent_npcs", "april_silent_part", "april_silent_players",
+    "april_silent_rand_head", "april_silent_rand_lower", "april_silent_rand_upper",
+    "april_silent_visible_only", "april_aimbot_fill_fov",
+    "april_aimbot_parts", "april_aimbot_team_check",
+    "april_btracer_enabled", "april_btracer_fade", "april_btracer_glow",
+    "april_btracer_hit_color", "april_btracer_hits_only", "april_btracer_impact",
+    "april_btracer_impact_size", "april_btracer_max", "april_btracer_origin",
+    "april_btracer_rainbow", "april_btracer_style", "april_btracer_thickness",
+    "april_btracer_time", "april_heli_aim", "april_hitsound_body", "april_hitsound_confirm",
+    "april_hitsound_enabled", "april_hitsound_head", "april_hitsound_npcs",
+    "april_hitsound_refresh", "april_hitsound_test_body", "april_hitsound_test_head",
+    "april_rage_autofire", "april_rage_draw_fov",
+    "april_rage_enabled", "april_rage_fill_fov", "april_rage_fov", "april_rage_indicator",
+    "april_rage_max_dist", "april_rage_min_dmg", "april_rage_multipoint", "april_rage_npcs",
+    "april_rage_override", "april_rage_override_dmg", "april_rage_part", "april_rage_parts",
+    "april_rage_players", "april_rage_priority", "april_rage_rand_head",
+    "april_rage_rand_larm", "april_rage_rand_lleg", "april_rage_rand_lower",
+    "april_rage_rand_rarm", "april_rage_rand_rleg", "april_rage_rand_upper",
+    "april_rage_reload_empty", "april_rage_shot", "april_rage_team_check",
+    "april_silent_fill_fov", "april_silent_parts", "april_silent_team_check",
+
+    "april_aim_whitelist", "april_player_chams", "april_player_chams_type",
+    "april_player_chams_mode", "april_player_chams_preset", "april_player_chams_style",
+    "april_player_chams_team", "april_npc_chams", "april_npc_chams_type",
+    "april_npc_chams_mode", "april_npc_chams_preset", "april_npc_chams_style",
+    "april_autofarm_rotation", "april_farm_rotation", "april_heli_aim_enabled",
+
+    "april_heli_aim_target", "april_heli_aim_fov", "april_heli_aim_smooth",
+    "april_heli_aim_max_dist", "april_heli_aim_visible_only", "april_heli_aim_draw_fov",
+    "april_heli_aim_fill_fov", "april_heli_aim_prediction", "april_heli_aim_accel",
+    "april_heli_aim_drop", "april_heli_aim_auto_weapon", "april_heli_aim_bullet_speed",
+    "april_heli_aim_gravity", "april_heli_aim_latency", "april_heli_aim_lead",
+    "april_heli_aim_debug",
 }
 local COLOR_KEYS = {
     "april_ui_accent", "april_ui_col_title", "april_ui_col_section",
     "april_ui_col_slider", "april_ui_col_scroll", "april_ui_col_sidebar",
     "april_ui_col_checkbox", "april_ui_col_overlay",
-    "april_crosshair_color", "april_crosshair_dot", "april_crosshair_outline",
     "april_aim_draw_fov", "april_aim_target_line",
     "april_player_enabled", "april_player_skeleton", "april_player_show_name", "april_player_clan_tag",
     "april_player_show_held", "april_player_show_distance",
@@ -6371,6 +6716,7 @@ local COLOR_KEYS = {
     "april_player_flag_staff", "april_player_flag_reviving",
     "april_player_flag_movement", "april_player_flag_vip",
     "april_player_flag_cheater",
+    "april_player_flag_animation",
     "april_player_box_color",
     "april_raid_enabled",
     "april_stone_node", "april_metal_node", "april_phosphate_node", "april_corn_plant", "april_tomato_plant",
@@ -6394,10 +6740,19 @@ local COLOR_KEYS = {
     "april_solar_panel", "april_windmill",
     "april_map_player_col", "april_map_npc_col", "april_map_loot_col",
     "april_map_world_col", "april_map_base_col", "april_map_raid_col",
-    "april_desync_visualizer",
+    "april_aimbot_auto_weapon_indicator", "april_aimbot_draw_fov",
+    "april_aimbot_drop_prediction_indicator", "april_aimbot_prediction_indicator",
+    "april_aimbot_fill_fov",
+    "april_silent_draw_fov",
+    "april_silent_fill_fov",
+    "april_rage_draw_fov", "april_rage_fill_fov",
+
+    "april_player_chams_color", "april_npc_chams_color", "april_btracer_hit_color",
+    "april_btracer_enabled",
+
+    "april_heli_aim_draw_fov", "april_heli_aim_fill_fov", "april_heli_aim_debug",
 }
 local LEGACY_HOTKEY_TO_CHECKBOX = {
-    april_crosshair_enabled_key = "april_crosshair_enabled",
     april_farm_helper_key = "april_farm_helper",
     april_world_enabled_key = "april_world_enabled",
     april_loot_enabled_key = "april_loot_enabled",
@@ -6405,7 +6760,6 @@ local LEGACY_HOTKEY_TO_CHECKBOX = {
     april_raid_enabled_key = "april_raid_enabled",
     april_base_enabled_key = "april_base_enabled",
     april_map_enabled_key = "april_map_enabled",
-    april_desync_enabled_key = "april_desync_enabled",
     april_mod_checker_enabled_key = "april_mod_checker_enabled",
 }
 local HOTKEY_KEYS = {
@@ -6418,13 +6772,14 @@ local HOTKEY_KEYS = {
     "april_base_enabled",
     "april_base_xray_enabled",
     "april_map_enabled",
-    "april_fling_enabled",
-    "april_desync_enabled",
-    "april_antiaim_enabled",
-    "april_fakeduck_enabled",
     "april_player_enabled",
     "april_aim_key",
     "april_ui_menu_key",
+    "april_aimbot_key", "april_aimbot_npcs_key", "april_aimbot_players_key",
+    "april_silent_aim",
+
+    "april_heli_aim_key",
+
 }
 local function collect_hotkey_keys()
     local out, seen = {}, {}
@@ -6916,11 +7271,41 @@ local function build_snapshot_lines(display_name)
     end
     return lines
 end
-local function apply_config_file(path, opts)
+local function apply_config_text(text, opts)
     opts = opts or {}
-    if not menu or not menu.set then return false end
-    local f = io.open(path, "r")
-    if not f then return false end
+    if not menu or not menu.set then return false, 0 end
+    if type(text) ~= "string" or text == "" then return false, 0 end
+    local entries = {}
+    for line in text:gmatch("[^\r\n]+") do
+        if line:sub(1, 1) ~= "#" and line:find("=") then
+            local key, val = line:match("^([^=]+)=(.+)$")
+            if key and val then
+                entries[#entries + 1] = { key = key, val = val }
+            end
+        end
+    end
+    local recognized = 0
+    if opts.require_known then
+        local known = {}
+        for _, id in ipairs(collect_menu_keys()) do known[id] = true end
+        for _, id in ipairs(COLOR_KEYS) do known[id] = true end
+        for _, id in ipairs(collect_hotkey_keys()) do known[id] = true end
+        for i = 1, #entries do
+            local key = entries[i].key
+            local id = nil
+            if key:sub(1, 7) == "@color:" then
+                id = key:sub(8)
+            elseif key:sub(1, 5) == "@key:" then
+                id = key:sub(6)
+            end
+            if id then
+                if known[id] then recognized = recognized + 1 end
+            elseif known[key] then
+                recognized = recognized + 1
+            end
+        end
+        if recognized == 0 then return false, 0 end
+    end
     if menu.set_key then
         for _, id in ipairs(collect_hotkey_keys()) do
             menu.set_key(id, 0)
@@ -6928,53 +7313,519 @@ local function apply_config_file(path, opts)
     end
     local loaded_keys = {}
     local profile_name
-    for line in f:lines() do
-        if line:sub(1, 1) ~= "#" and line:find("=") then
-            local key, val = line:match("^([^=]+)=(.+)$")
-            if key and val then
-                if key == "profile_name" then
-                    profile_name = val
-                    menu.set("april_cfg_profile_name", val)
-                elseif key:sub(1, 7) == "@color:" then
-                    local id = key:sub(8)
-                    local r, g, b, a = val:match("([^,]+),([^,]+),([^,]+),([^,]+)")
-                    if id and menu.set_color then
-                        menu.set_color(id, {
-                            tonumber(r) or 0,
-                            tonumber(g) or 0,
-                            tonumber(b) or 0,
-                            tonumber(a) or 1,
-                        })
-                    end
-                elseif key:sub(1, 5) == "@key:" then
-                    local id = key:sub(6)
-                    local vk = tonumber(val)
-                    if id and vk and menu.set_key then
-                        local target = LEGACY_HOTKEY_TO_CHECKBOX[id] or id
-                        menu.set_key(target, vk)
-                    end
-                elseif not EXCLUDE[key] then
-                    menu.set(key, parse_value(val))
-                    loaded_keys[key] = true
-                end
+    for i = 1, #entries do
+        local key, val = entries[i].key, entries[i].val
+        if key == "profile_name" then
+            profile_name = val
+            if not opts.keep_profile then
+                menu.set("april_cfg_profile_name", val)
             end
+        elseif key:sub(1, 7) == "@color:" then
+            local id = key:sub(8)
+            local r, g, b, a = val:match("([^,]+),([^,]+),([^,]+),([^,]+)")
+            if id and menu.set_color then
+                menu.set_color(id, {
+                    tonumber(r) or 0,
+                    tonumber(g) or 0,
+                    tonumber(b) or 0,
+                    tonumber(a) or 1,
+                })
+            end
+        elseif key:sub(1, 5) == "@key:" then
+            local id = key:sub(6)
+            local vk = tonumber(val)
+            if id and vk and menu.set_key then
+                local target = LEGACY_HOTKEY_TO_CHECKBOX[id] or id
+                menu.set_key(target, vk)
+            end
+        elseif not EXCLUDE[key] then
+            menu.set(key, parse_value(val))
+            loaded_keys[key] = true
         end
     end
-    if loaded_keys.april_target_gear_source
-        and not loaded_keys.april_crosshair_source
-        and menu.get
-    then
-        menu.set("april_crosshair_source", menu.get("april_target_gear_source"))
+    if loaded_keys.april_ui_russian and not loaded_keys.april_ui_language and menu.get then
+        -- configs saved before the language selector only stored the Russian checkbox
+        menu.set("april_ui_language", menu.get("april_ui_russian") == true and 1 or 0)
     end
-    f:close()
     if opts.stem then
         M.set_selected_stem(opts.stem)
-    elseif profile_name then
+    elseif profile_name and not opts.keep_profile then
         M.set_selected_stem(profile_name)
     end
     April.require("core.settings").invalidate()
     April.require("core.menu_util").sync_masters()
-    return true
+    return true, recognized
+end
+local function apply_config_file(path, opts)
+    if not path or not io or not io.open then return false, 0 end
+    local f = io.open(path, "r")
+    if not f then return false, 0 end
+    local body = f:read("*a")
+    f:close()
+    return apply_config_text(body, opts)
+end
+-- Built-in preset "nhandzqn": applies the same settings as April_configs/1.cfg
+-- without requiring the file to exist on disk.
+M.PRESET_NHANDZQN = [==[
+# April config v3
+version=3
+profile_name=1
+april_ui_russian=false
+april_ui_language=0
+april_ui_theme_preset=0
+april_ui_window_opacity=86
+april_ui_panel_opacity=72
+april_ui_border_strength=58
+april_ui_corner_style=2
+april_ui_scale=102
+april_ui_density=1
+april_ui_menu_overlay=true
+april_ui_overlay_strength=70
+april_ui_snow=false
+april_ui_snow_amount=50
+april_ui_snow_speed=40
+april_ui_snow_size=3
+april_ui_snow_opacity=55
+april_ui_startup_intro=true
+april_ui_motion_profile=1
+april_ui_reduce_motion=false
+april_ui_custom_colors=false
+april_ui_custom_anim=true
+april_ui_show_cursor_dot=true
+april_ui_accent_anim=1
+april_ui_anim_speed=40
+april_ui_menu_fade=false
+april_ui_anim_targets=1,1,1,1,1,1,1,1
+april_ui_color_overrides=
+april_ui_per_element=false
+april_ui_style_title=0
+april_ui_style_section=0
+april_ui_style_slider=0
+april_ui_style_scroll=0
+april_ui_style_sidebar=0
+april_ui_style_checkbox=0
+april_ui_style_overlay=0
+april_ui_window_x=501
+april_ui_window_y=115
+april_anime_baddie_enabled=false
+april_anime_baddie_character=0
+april_anime_baddie_personality=0
+april_anime_baddie_events=1,1,1,1,1,1,1,1
+april_anime_baddie_scale=100
+april_anime_baddie_opacity=100
+april_anime_baddie_duration=5
+april_anime_baddie_cooldown=8
+april_anime_baddie_stay=true
+april_anime_baddie_x=16
+april_anime_baddie_y=-1
+april_esp_text_size=13
+april_player_enabled=true
+april_player_enabled_mode=0
+april_player_box_mode=2
+april_player_box_color=1,0.35,0.35,1
+april_player_health=true
+april_player_skeleton=true
+april_player_show_name=true
+april_player_show_held=true
+april_player_show_distance=true
+april_player_clan_tag=false
+april_player_flag_downed=1,0.35,0.35,1
+april_player_flag_safezone=0.35,0.85,1,1
+april_player_flag_staff=1,0.33,0.33,1
+april_player_flag_reviving=0.45,1,0.55,1
+april_player_flag_movement=0.75,0.85,1,1
+april_player_flag_vip=1,0.82,0.2,1
+april_player_flag_cheater=1,0.05,0.05,1
+april_player_flag_animation=0.95,0.78,1,1
+april_player_esp_filters=1,0,0
+april_player_esp_flags=1,1,1,1,0,0,1,0
+april_ui_player_elements=1,1,1,0,1,1
+april_player_range=1145
+april_target_overlay=true
+april_target_overlay_fov=100
+april_target_overlay_max_dist=675
+april_target_overlay_gear_size=48
+april_target_overlay_top=88
+april_aimbot=true
+april_aimbot_mode=0
+april_aim_key_mode=1
+april_aim_target_type=0
+april_aim_bone=7
+april_aim_filters=1,0,1,1,0,1
+april_aim_whitelist_ids=
+april_aim_targets=1,1,1,1,1,1,0,0,0,0,1
+april_aim_sticky=true
+april_aim_auto_pred=true
+april_aim_draw_fov=true
+april_aim_fov_style=0
+april_aim_target_line=false
+april_aim_max_dist=1145
+april_aim_fov=120
+april_aim_smooth=1
+april_aim_smooth_type=0
+april_aim_humanize=false
+april_aim_humanize_str=35
+april_rcs_enabled=true
+april_rcs_enabled_mode=0
+april_rcs_strength=100
+april_rcs_sideways=true
+april_rcs_humanize_pct=0
+april_autofarm=false
+april_autofarm_mode=0
+april_autofarm_resources=1,1,1,1
+april_autofarm_search_range=500
+april_autofarm_debug_path=false
+april_farm_helper=false
+april_farm_helper_mode=0
+april_farm_radius=7
+april_world_enabled=false
+april_world_enabled_mode=2
+april_stone_node=true
+april_metal_node=false
+april_phosphate_node=false
+april_corn_plant=false
+april_tomato_plant=false
+april_pumpkin_plant=false
+april_lemon_plant=false
+april_raspberry_plant=false
+april_blueberry_plant=false
+april_wool_plant=false
+april_deer=false
+april_boar=false
+april_wolf=false
+april_world_boxes=false
+april_world_show_name=true
+april_world_show_distance=true
+april_world_range=500
+april_world_chams_enabled=false
+april_world_chams=0,0,0,0,0,0,0,0,0,0,0,0,0
+april_world_chams_mode=0
+april_world_chams_color=0
+april_loot_enabled=false
+april_loot_enabled_mode=2
+april_dropped_item=true
+april_wooden_crate=false
+april_metal_crate=false
+april_steel_crate=false
+april_food_crate=false
+april_timed_crate=true
+april_care_package=true
+april_btr_crate=false
+april_body_bag=true
+april_sleeper=false
+april_trash_can=false
+april_oil_barrel=false
+april_small_egg=false
+april_medium_egg=false
+april_large_egg=false
+april_wooden_boat=false
+april_military_boat=false
+april_flycopter=true
+april_heli_crate=false
+april_loot_boxes=false
+april_loot_show_name=true
+april_loot_show_distance=true
+april_loot_range=915
+april_loot_chams_enabled=false
+april_loot_chams=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+april_loot_chams_mode=0
+april_loot_chams_color=0
+april_npc_enabled=true
+april_npc_enabled_mode=0
+april_npc_soldier=true
+april_npc_bruno=true
+april_npc_boris=true
+april_npc_brutus=true
+april_npc_attack_heli=true
+april_npc_btr=true
+april_npc_diver_dave=true
+april_npc_pilot_pete=true
+april_npc_sleeper=false
+april_npc_zombie=true
+april_npc_box_mode=2
+april_npc_health=true
+april_npc_show_name=true
+april_npc_show_distance=true
+april_npc_range=745
+april_npc_tracers=false
+april_npc_offscreen=false
+april_ui_npc_types=1,1,1,1,1,1,1,1,0,1
+april_ui_npc_elements=1,1,1
+april_raid_enabled=true
+april_raid_enabled_mode=2
+april_raid_notifications=true
+april_raid_range=5000
+april_base_enabled=false
+april_base_enabled_mode=2
+april_base_cabinet=true
+april_storage_cabinet=true
+april_small_box=false
+april_large_box=false
+april_sleeping_bag=false
+april_auto_turret=false
+april_auto_turret_ring=false
+april_shotgun_turret=false
+april_shotgun_turret_ring=false
+april_wooden_door=false
+april_wooden_double_door=false
+april_salvaged_door=false
+april_metal_door=false
+april_metal_double_door=false
+april_steel_door=false
+april_steel_double_door=false
+april_garage_door=false
+april_trap_door=false
+april_triangle_trap_door=false
+april_small_battery=false
+april_medium_battery=false
+april_large_battery=false
+april_solar_panel=false
+april_windmill=false
+april_base_boxes=true
+april_base_show_name=true
+april_base_show_distance=false
+april_base_range=500
+april_base_chams=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+april_base_chams_mode=0
+april_base_chams_color=0
+april_base_xray_enabled=false
+april_base_xray_enabled_mode=0
+april_base_xray_range=180
+april_map_enabled=false
+april_map_enabled_mode=0
+april_map_zoom=2.3043373493976
+april_map_size=260
+april_map_opacity=100
+april_map_icon_scale=3
+april_map_show_players=true
+april_map_show_npcs=false
+april_map_show_loot=false
+april_map_show_world=false
+april_map_show_base=false
+april_map_show_raids=true
+april_map_labels=false
+april_map_x=1644
+april_map_y=16
+april_keybinds_enabled=false
+april_keybinds_active_only=false
+april_keybinds_show_unbound=true
+april_keybinds_show_mode=true
+april_mod_checker_enabled=true
+april_mod_checker_interval=2500
+april_mod_checker_x=1622
+april_mod_checker_y=72
+april_event_status_enabled=true
+april_event_status_active_only=true
+april_event_status_notify=true
+april_event_status_distance=true
+april_event_status_health=true
+april_event_status_sort=1
+april_event_status_x=1554
+april_event_status_y=300
+april_aimbot_auto_weapon=true
+april_aimbot_auto_weapon_indicator=true
+april_aimbot_bone=4
+april_aimbot_bullet_speed=2100
+april_aimbot_draw_fov=true
+april_aimbot_drop_prediction=true
+april_aimbot_drop_prediction_indicator=true
+april_aimbot_enabled=true
+april_aimbot_fov=150
+april_aimbot_gravity=108
+april_aimbot_humanize=false
+april_aimbot_npc_mode=0
+april_aimbot_npcs=true
+april_aimbot_player_mode=0
+april_aimbot_players=true
+april_aimbot_prediction=true
+april_aimbot_prediction_indicator=true
+april_aimbot_rand_head=50
+april_aimbot_rand_lower=20
+april_aimbot_rand_upper=30
+april_aimbot_smooth=1
+april_aimbot_sticky=true
+april_aimbot_visible_only=false
+april_silent_aim=false
+april_aimbot_fill_fov=false
+april_aimbot_parts=1,1,1
+april_aimbot_team_check=true
+april_btracer_enabled=false
+april_hitsound_enabled=false
+april_rage_enabled=false
+april_rage_override=false
+april_aim_whitelist=false
+april_player_chams=false
+april_npc_chams=false
+april_heli_aim_enabled=false
+april_heli_aim_target=0
+april_heli_aim_fov=300
+april_heli_aim_smooth=3
+april_heli_aim_max_dist=1000
+april_heli_aim_visible_only=false
+april_heli_aim_draw_fov=true
+april_heli_aim_fill_fov=false
+april_autofarm_hide_kb=false
+april_base_enabled_hide_kb=false
+april_base_xray_enabled_hide_kb=false
+april_map_enabled_hide_kb=false
+april_event_status_enabled_mode=0
+april_event_status_enabled_hide_kb=false
+april_farm_helper_hide_kb=false
+april_loot_enabled_hide_kb=false
+april_rage_override_mode=1
+april_npc_enabled_hide_kb=false
+april_player_enabled_hide_kb=false
+april_rage_enabled_mode=0
+april_rage_enabled_hide_kb=false
+april_raid_enabled_hide_kb=false
+april_rcs_enabled_hide_kb=false
+april_world_enabled_hide_kb=false
+april_target_overlay_mode=0
+april_target_overlay_hide_kb=false
+@color:april_ui_accent=1,1,1,1
+@color:april_ui_col_title=0.76,0.28,0.98,1
+@color:april_ui_col_section=0.76,0.28,0.98,1
+@color:april_ui_col_slider=0.76,0.28,0.98,1
+@color:april_ui_col_scroll=0.76,0.28,0.98,1
+@color:april_ui_col_sidebar=0.76,0.28,0.98,1
+@color:april_ui_col_checkbox=0.76,0.28,0.98,1
+@color:april_ui_col_overlay=0.76,0.28,0.98,1
+@color:april_aim_draw_fov=0.94856770833333,0.96875,0.956640625,1
+@color:april_aim_target_line=0.2,1,0.45,1
+@color:april_player_enabled=1,1,1,1
+@color:april_player_skeleton=1,1,1,0.92
+@color:april_player_show_name=0.95833333333333,0.95833333333333,0.95833333333333,1
+@color:april_player_clan_tag=0.84,0.31,0.8,1
+@color:april_player_show_held=0.95833333333333,0.106689453125,0.049913194444444,0.95
+@color:april_player_show_distance=1,1,0.041666666666667,0.92
+@color:april_player_flag_downed=1,0.35,0.35,1
+@color:april_player_flag_safezone=0.35,0.85,1,1
+@color:april_player_flag_staff=1,0.33,0.33,1
+@color:april_player_flag_reviving=0.45,1,0.55,1
+@color:april_player_flag_movement=0.75,0.85,1,1
+@color:april_player_flag_vip=1,0.82,0.2,1
+@color:april_player_flag_cheater=1,0.05,0.05,1
+@color:april_player_flag_animation=0.95,0.78,1,1
+@color:april_player_box_color=0.9375,0.908203125,0.908203125,1
+@color:april_raid_enabled=1,0.5,0,1
+@color:april_stone_node=0.94791666666667,0.86892361111111,0.86892361111111,1
+@color:april_metal_node=0.7,0.5,0.3,1
+@color:april_phosphate_node=0.2,0.8,0.2,1
+@color:april_corn_plant=1,0.9,0.3,1
+@color:april_tomato_plant=1,0.4,0.3,1
+@color:april_pumpkin_plant=1,0.5,0.1,1
+@color:april_lemon_plant=1,0.95,0.2,1
+@color:april_raspberry_plant=0.9,0.2,0.4,1
+@color:april_blueberry_plant=0.3,0.4,0.9,1
+@color:april_wool_plant=0.85,0.85,0.9,1
+@color:april_deer=0.6,0.4,0.2,1
+@color:april_boar=0.4,0.3,0.2,1
+@color:april_wolf=0.5,0.5,0.5,1
+@color:april_dropped_item=1,0.8,0,1
+@color:april_wooden_crate=0.6,0.4,0.2,1
+@color:april_metal_crate=0.5,0.5,0.6,1
+@color:april_steel_crate=0.7,0.7,0.8,1
+@color:april_food_crate=0.2,0.8,0.2,1
+@color:april_timed_crate=1,0.5,0,1
+@color:april_care_package=1,0.2,0.2,1
+@color:april_btr_crate=0.8,0.15,0.15,1
+@color:april_body_bag=0.91666666666667,0.057291666666667,0.057291666666667,1
+@color:april_sleeper=0.8,0.4,0.8,1
+@color:april_trash_can=0.45,0.45,0.45,1
+@color:april_oil_barrel=0.2,0.2,0.2,1
+@color:april_small_egg=0.95,0.85,0.5,1
+@color:april_medium_egg=0.9,0.7,0.4,1
+@color:april_large_egg=0.85,0.55,0.3,1
+@color:april_wooden_boat=0.55,0.35,0.15,1
+@color:april_military_boat=0.35,0.45,0.35,1
+@color:april_flycopter=0.020616319444445,0.020616319444445,0.98958333333333,1
+@color:april_heli_crate=0.75,0.25,0.2,1
+@color:april_npc_soldier=1,0.3,0.3,1
+@color:april_npc_bruno=1,0.65,0.2,1
+@color:april_npc_boris=0.78,0.42,1,1
+@color:april_npc_brutus=1,0.3,0.48,1
+@color:april_npc_attack_heli=0.85,0.2,0.25,1
+@color:april_npc_btr=0.95,0.25,0.15,1
+@color:april_npc_diver_dave=0.2,0.75,1,1
+@color:april_npc_pilot_pete=0.35,1,0.65,1
+@color:april_npc_sleeper=0.6,0.85,1,1
+@color:april_npc_zombie=0.55,0.9,0.3,1
+@color:april_npc_soldiers=1,1,1,1
+@color:april_npc_bosses=1,1,1,1
+@color:april_npc_heli=1,1,1,1
+@color:april_npc_show_name=0.051540798611111,0.57918972439236,0.98958333333333,1
+@color:april_npc_show_distance=0.82,0.84,0.88,0.92
+@color:april_base_cabinet=0.90625,0.092041015625,0.037760416666667,1
+@color:april_storage_cabinet=0,6.0294016241483e-07,0.77083333336498,0.93220338983051
+@color:april_small_box=0.55,0.35,0.15,1
+@color:april_large_box=0.45,0.3,0.12,1
+@color:april_sleeping_bag=0.8,0.2,0.2,1
+@color:april_auto_turret=1,0.2,0.2,1
+@color:april_auto_turret_ring=1,1,1,1
+@color:april_shotgun_turret=1,0.35,0.2,1
+@color:april_shotgun_turret_ring=1,1,1,1
+@color:april_wooden_door=0.5,0.3,0.1,1
+@color:april_wooden_double_door=0.55,0.32,0.12,1
+@color:april_salvaged_door=0.55,0.52,0.48,1
+@color:april_metal_door=0.5,0.5,0.6,1
+@color:april_metal_double_door=0.52,0.52,0.58,1
+@color:april_steel_door=0.65,0.65,0.72,1
+@color:april_steel_double_door=0.62,0.62,0.7,1
+@color:april_garage_door=0.4,0.4,0.42,1
+@color:april_trap_door=0.48,0.38,0.22,1
+@color:april_triangle_trap_door=0.46,0.36,0.2,1
+@color:april_small_battery=0.2,0.75,0.35,1
+@color:april_medium_battery=0.15,0.65,0.3,1
+@color:april_large_battery=0.1,0.55,0.25,1
+@color:april_solar_panel=0.2,0.4,0.85,1
+@color:april_windmill=0.75,0.85,0.95,1
+@color:april_map_player_col=1,0.35,0.35,1
+@color:april_map_npc_col=1,0.55,0.22,1
+@color:april_map_loot_col=1,0.85,0.35,1
+@color:april_map_world_col=0.35,0.85,0.55,1
+@color:april_map_base_col=0.55,0.55,1,1
+@color:april_map_raid_col=1,0.5,0,1
+@color:april_aimbot_auto_weapon_indicator=1,1,1,1
+@color:april_aimbot_draw_fov=1,1,1,1
+@color:april_aimbot_drop_prediction_indicator=1,0.5,0,1
+@color:april_aimbot_prediction_indicator=0,1,1,1
+@color:april_aimbot_fill_fov=1,1,1,0.25
+@color:april_silent_draw_fov=1,1,1,1
+@color:april_silent_fill_fov=1,1,1,1
+@color:april_rage_draw_fov=1,1,1,1
+@color:april_rage_fill_fov=1,1,1,1
+@color:april_player_chams_color=1,1,1,1
+@color:april_npc_chams_color=1,1,1,1
+@color:april_btracer_hit_color=1,1,1,1
+@color:april_btracer_enabled=0.35,0.75,1,1
+@color:april_heli_aim_draw_fov=1,0.55,0.2,1
+@color:april_heli_aim_fill_fov=1,0.55,0.2,0.25
+@color:april_heli_aim_debug=1,1,1,1
+@key:april_aim_key=2
+@key:april_aimbot_key=2
+@key:april_aimbot_npcs_key=0
+@key:april_aimbot_players_key=0
+@key:april_autofarm=0
+@key:april_base_enabled=99
+@key:april_base_xray_enabled=0
+@key:april_event_status_enabled=0
+@key:april_farm_helper=0
+@key:april_heli_aim_key=2
+@key:april_loot_enabled=98
+@key:april_map_enabled=0
+@key:april_npc_enabled=0
+@key:april_player_enabled=0
+@key:april_rage_enabled=0
+@key:april_rage_override=0
+@key:april_raid_enabled=107
+@key:april_rcs_enabled=0
+@key:april_silent_aim=0
+@key:april_target_overlay=0
+@key:april_ui_menu_key=163
+@key:april_world_enabled=97
+]==]
+function M.apply_preset_nhandzqn()
+    return apply_config_text(M.PRESET_NHANDZQN, { keep_profile = true, require_known = true })
 end
 function M.save_config(name)
     if not menu or not menu.get then return false, nil end
@@ -9139,6 +9990,46 @@ local FALLBACK_STATS = {
     ["Wooden Spear"] = { speed = 130, gravity = 0.35 },
     ["Stone Spear"] = { speed = 150, gravity = 0.35 },
 }
+-- Bows and crossbows use Kaytee's numbers (speed in studs/s, gravity in studs/s^2), ahead of
+-- ToolInfo and the fallback table.
+local BOW_STATS = {
+    ["Crossbow"] = { speed = 400, gravity = 35 },
+    ["Wooden Bow"] = { speed = 300, gravity = 30 },
+}
+-- Damage per shot, rounds per minute, damage dropoff band (studs) and headshot multiplier from
+-- the Fallen Survival wiki weapon tables; headshots are 1.5x unless the update log raised them.
+-- Vector cannot load the game's ToolInfo, so the damage estimate, the ragebot's fire rate and the
+-- gun's range come from here.
+local WIKI_STATS = {
+    ["Military PKM"] = { dmg = 55, rpm = 425, drop = { 600, 1000 } },
+    ["Military M4A1"] = { dmg = 40, rpm = 500, drop = { 550, 950 } },
+    ["Bruno's M4A1"] = { dmg = 42, rpm = 530, drop = { 550, 950 } },
+    ["Military MP7"] = { dmg = 36, rpm = 575, drop = { 325, 700 } },
+    ["Salvaged AK-47"] = { dmg = 50, rpm = 450, drop = { 550, 1000 } },
+    ["Salvaged AK74u"] = { dmg = 35, rpm = 540, drop = { 325, 700 } },
+    ["Salvaged SMG"] = { dmg = 36, rpm = 462, drop = { 325, 700 } },
+    ["Salvaged Skorpion"] = { dmg = 30, rpm = 600, drop = { 250, 500 } },
+    ["Military Barrett"] = { dmg = 80, rpm = 30, drop = { 550, 1000 }, hs = 1.75 },
+    ["Military USP"] = { dmg = 38, rpm = 430, drop = { 275, 525 } },
+    ["Salvaged Sniper"] = { dmg = 70, rpm = 30, drop = { 450, 1000 } },
+    ["Salvaged Pipe Rifle"] = { dmg = 56, rpm = 16, drop = { 400, 750 }, hs = 1.75 },
+    ["Salvaged M14"] = { dmg = 40, rpm = 370, drop = { 550, 1000 } },
+    ["Salvaged Python"] = { dmg = 54, rpm = 300, drop = { 325, 600 } },
+    ["Salvaged P250"] = { dmg = 35, rpm = 375, drop = { 250, 500 } },
+    ["Military AA12"] = { dmg = 52, rpm = 220, drop = { 0, 150 } },
+    ["Salvaged Pump Action"] = { dmg = 64, rpm = 20, drop = { 20, 150 } },
+    ["Salvaged Break Action"] = { dmg = 64, rpm = 15, drop = { 10, 150 } },
+    ["Salvaged Shotgun"] = { dmg = 60, rpm = 23, drop = { 10, 80 } },
+    ["Nail Gun"] = { dmg = 18, rpm = 400, drop = { 25, 100 } },
+    ["Crossbow"] = { dmg = 60, rpm = 14, drop = { 175, 375 }, hs = 1.75 },
+    ["Wooden Bow"] = { dmg = 40, rpm = 37, drop = { 125, 300 }, hs = 1.6 },
+    ["Salvaged RPG"] = { dmg = 175, rpm = 11 },
+    ["Pumpkin Launcher"] = { dmg = 70, rpm = 70 },
+}
+-- names April also sees for the same guns
+WIKI_STATS["Salvaged AK47"] = WIKI_STATS["Salvaged AK-47"]
+WIKI_STATS["Military Barret"] = WIKI_STATS["Military Barrett"]
+WIKI_STATS["Salvaged Double Barrel"] = WIKI_STATS["Salvaged Break Action"]
 M._last_held = nil
 M._last_held_ranged = nil
 M._was_in_game = false
@@ -9288,6 +10179,21 @@ local function find_held_in_character(lp)
     if fallback_tool then
         return fallback_tool.name, fallback_tool.inst
     end
+    return nil, nil
+end
+-- The weapon model in your first-person viewmodel, and the item another character holds.
+function M.viewmodel_weapon()
+    return find_held_in_viewmodels()
+end
+function M.held_in_character(char)
+    if not char or not env.is_valid(char) then return nil, nil end
+    local fallback = nil
+    for _, child in ipairs(children_of(char)) do
+        local n = inst_name(child)
+        if n and M.is_weapon_name(n) then return n, child end
+        if is_tool(child) and n then fallback = fallback or child end
+    end
+    if fallback then return inst_name(fallback), fallback end
     return nil, nil
 end
 local function read_tool_attributes(inst)
@@ -9444,6 +10350,9 @@ function M.drop_gravity(grav)
     if grav <= 2 then return grav * ROBLOX_GRAV end
     return grav
 end
+function M.wiki_stats(name)
+    return name and WIKI_STATS[name] or nil
+end
 function M.shot_interval_ms(name)
     name = name or M.cached_held_ranged() or M.get_held_ranged_weapon_name()
     if not name then return 100 end
@@ -9459,11 +10368,19 @@ function M.shot_interval_ms(name)
             return math.max(16, math.floor(cd * 1000 + 0.5))
         end
     end
+    local wiki = WIKI_STATS[name]
+    if wiki and wiki.rpm then
+        return math.max(16, math.floor(60000 / wiki.rpm + 0.5))
+    end
     return 100
 end
 function M.get_weapon_stats(name)
     name = name or M.get_held_weapon_name()
     if not name then return nil end
+    local bow = BOW_STATS[name]
+    if bow then
+        return { speed = bow.speed, gravity = bow.gravity, name = name, from_fallback = true, is_bow = true }
+    end
     local entry = M.get(name)
     if entry and entry.Bullet then
         return {
@@ -9493,6 +10410,23 @@ function M.get_weapon_stats(name)
         end
     end
     return { speed = 950, gravity = 0.55, name = name }
+end
+-- A gun's range (studs): MaxRange from ToolInfo when it is loaded, otherwise where the wiki's
+-- damage dropoff band ends. Past it there is nothing to lead or drop. Small values are melee
+-- reach and are ignored.
+function M.max_range(name)
+    local entry = name and M.get(name)
+    if type(entry) == "table" then
+        for _, t in ipairs({ entry.Bullet, entry.Weapon, entry }) do
+            if type(t) == "table" then
+                local v = tonumber(t.MaxRange or t.maxRange or t.max_range)
+                if v and v > 20 then return v end
+            end
+        end
+    end
+    local wiki = name and WIKI_STATS[name]
+    if wiki and wiki.drop and wiki.drop[2] > 20 then return wiki.drop[2] end
+    return nil
 end
 function M.tick()
     local in_game = M.in_game_ready()
@@ -15748,462 +16682,6 @@ end
 return M
 end)()
 
-April._mods["features.combat.active_target"] = (function()
-local settings = April.require("core.settings")
-local targeting = April.require("features.combat.targeting")
-local combat_origin = April.require("game.combat_origin")
-local esp_util = April.require("core.esp_util")
-local M = {}
-M.SOURCE_NAMES = { "Auto", "Aimbot" }
-M.SOURCE_CROSSHAIR = "april_crosshair_source"
-local MODULES = {
-    { id = "april_aimbot", path = "features.combat.camera_aimbot", prefix = "april_aim_" },
-}
-local function load_mod(entry)
-    local ok, mod = pcall(function()
-        return April.require(entry.path)
-    end)
-    if ok then return mod end
-    return nil
-end
-function M.source_index(source_id)
-    source_id = source_id or M.SOURCE_CROSSHAIR
-    return math.floor(settings.num(source_id, 0) or 0)
-end
-function M.resolve_source_index(source_id)
-    local idx = M.source_index(source_id)
-    if idx >= 1 and idx <= #MODULES then
-        if settings.enabled(MODULES[idx].id) then
-            return idx
-        end
-        return nil
-    end
-    for i = 1, #MODULES do
-        if settings.enabled(MODULES[i].id) then
-            return i
-        end
-    end
-    return nil
-end
-function M.get_entry(source_idx, source_id)
-    source_idx = source_idx or M.resolve_source_index(source_id)
-    if not source_idx then return nil end
-    return MODULES[source_idx]
-end
-function M.get_target(source_idx, source_id)
-    local entry = M.get_entry(source_idx, source_id)
-    if not entry then return nil, nil end
-    local mod = load_mod(entry)
-    if not mod then return nil, entry.prefix end
-    if mod.get_target then
-        local t = mod.get_target()
-        if t then return t, entry.prefix end
-    end
-    if mod.get_scoped_target then
-        local t = mod.get_scoped_target()
-        if t then return t, entry.prefix end
-    end
-    return nil, entry.prefix
-end
-function M.get_aim_world(source_idx, cx, cy, source_id)
-    local target, prefix = M.get_target(source_idx, source_id)
-    if not target or not prefix then return nil, target, prefix end
-    local sw, sh = targeting.screen_center()
-    cx = cx or sw * 0.5
-    cy = cy or sh * 0.5
-    local origin = combat_origin.get_camera_origin() or combat_origin.get_fire_origin()
-    local aim = targeting.get_aim_point(target, prefix, nil, origin, cx, cy, false)
-    return aim, target, prefix
-end
-function M.get_aim_screen(source_idx, cx, cy, source_id)
-    local aim, target, prefix = M.get_aim_world(source_idx, cx, cy, source_id)
-    if not aim then return nil, target, prefix end
-    local sx, sy, vis = esp_util.w2s(aim.x, aim.y, aim.z)
-    if not vis then return nil, target, prefix end
-    return { x = sx, y = sy }, target, prefix
-end
-return M
-end)()
-
-April._mods["features.combat.camera_aimbot"] = (function()
-local settings = April.require("core.settings")
-local targeting = April.require("features.combat.targeting")
-local weapons = April.require("game.weapons")
-local combat_origin = April.require("game.combat_origin")
-local draw_util = April.require("core.draw_util")
-local menu_util = April.require("core.menu_util")
-local combat_menu = April.require("features.combat.combat_menu")
-local silent_whitelist = April.require("features.combat.silent_whitelist")
-local aim_key = April.require("core.aim_key")
-local theme = April.require("core.ui_theme")
-local M = {}
-local locked_target = nil
-local PREFIX = "april_aim_"
-local P_MASTER = "april_aimbot"
-local P_AIM_KEY = "april_aim_key"
-local P_AIM_KEY_MODE = "april_aim_key_mode"
-local SHOOT_VK = 0x01
-local TARGET_SCAN_MS = 33
-local cached_aim = nil
-local smoothed_aim = nil
-local last_target_scan = 0
-local was_aiming = false
-local fire_was_down = false
-local last_random_shot_ms = 0
-local human_phase = 0
-local human_drift = { x = 0, y = 0, z = 0 }
-local overshoot = { x = 0, y = 0, z = 0 }
-local SMOOTH_LINEAR = 0
-local SMOOTH_EASE_OUT = 1
-local SMOOTH_EASE_IN_OUT = 2
-local SMOOTH_EXPONENTIAL = 3
-local SMOOTH_ADAPTIVE = 4
-local function tick_ms()
-return utility and utility.get_tick_count and utility.get_tick_count() or 0
-end
-local function shot_roll_interval_ms()
-return weapons.shot_interval_ms()
-end
-local function tick_random_bone_while_firing(target)
-local key_down = input and (input.is_key_down or input.IsKeyDown)
-local firing = key_down and key_down(SHOOT_VK) == true
-if targeting.bone_name(PREFIX) == "Random" and target and firing then
-local now = tick_ms()
-if (not fire_was_down) or (now - last_random_shot_ms >= shot_roll_interval_ms()) then
-last_random_shot_ms = now
-targeting.pick_random_bone(target, PREFIX, true)
-end
-elseif not firing then
-last_random_shot_ms = 0
-end
-fire_was_down = firing and true or false
-end
-local function w2s(x, y, z)
-if draw and draw.world_to_screen then
-return draw.world_to_screen(x, y, z)
-end
-if utility and utility.world_to_screen then
-return utility.world_to_screen(x, y, z)
-end
-return 0, 0, false
-end
-local function holding_weapon()
-if weapons.holding_ranged_weapon() then return true end
-if weapons.get_held_ranged_weapon_name() then return true end
-local lp = entity and entity.get_local_player and entity.get_local_player()
-if lp and lp.tool_name and lp.tool_name ~= "" then
-return weapons.is_ranged_weapon_name(lp.tool_name)
-end
-return false
-end
-local function enabled()
-return settings.enabled(P_MASTER)
-end
-local function aiming()
-if not enabled() then return false end
-return aim_key.active(P_AIM_KEY, P_AIM_KEY_MODE)
-end
-local function aim_dist(a, b)
-if not a or not b then return 0 end
-local dx = (a.x or 0) - (b.x or 0)
-local dy = (a.y or 0) - (b.y or 0)
-local dz = (a.z or 0) - (b.z or 0)
-return math.sqrt(dx * dx + dy * dy + dz * dz)
-end
-local function base_smooth_alpha()
-local n = settings.num(PREFIX .. "smooth", 10)
-n = math.max(1, math.min(25, n))
-return math.max(0.08, math.min(0.95, 1.25 / n))
-end
-local function smooth_alpha(prev, nxt)
-local base = base_smooth_alpha()
-local style = math.floor(tonumber(settings.num(PREFIX .. "smooth_type", 0)) or 0)
-if style == SMOOTH_LINEAR then
-return base
-end
-local t = math.min(1, aim_dist(prev, nxt) / 8)
-if style == SMOOTH_EASE_OUT then
-return math.max(0.05, math.min(0.98, base * (0.45 + 0.95 * t)))
-elseif style == SMOOTH_EASE_IN_OUT then
-local u = t * t * (3 - 2 * t)
-return math.max(0.05, math.min(0.98, base * (0.5 + 0.85 * u)))
-elseif style == SMOOTH_EXPONENTIAL then
-return math.max(0.05, math.min(0.99, 1 - ((1 - base) ^ (1 + t * 1.6))))
-elseif style == SMOOTH_ADAPTIVE then
-return math.max(0.04, math.min(0.98, base * (0.32 + 1.45 * t)))
-end
-return base
-end
-local function reset_humanize()
-human_phase = 0
-human_drift.x, human_drift.y, human_drift.z = 0, 0, 0
-overshoot.x, overshoot.y, overshoot.z = 0, 0, 0
-end
-local function apply_humanize(aim, prev)
-if not aim or not settings.bool(PREFIX .. "humanize", false) then
-return aim
-end
-local str = math.max(0, math.min(100, settings.num(PREFIX .. "humanize_str", 35))) / 100
-if str <= 0 then return aim end
-human_phase = human_phase + (0.035 + str * 0.04)
-local amp = 0.05 + str * 0.28
-local target_drift = {
-x = math.sin(human_phase * 1.7) * amp,
-y = math.cos(human_phase * 1.25) * amp * 0.55,
-z = math.sin(human_phase * 2.05 + 0.7) * amp * 0.4,
-}
-local da = 0.12 + str * 0.1
-human_drift.x = human_drift.x + (target_drift.x - human_drift.x) * da
-human_drift.y = human_drift.y + (target_drift.y - human_drift.y) * da
-human_drift.z = human_drift.z + (target_drift.z - human_drift.z) * da
-if prev then
-local dx = (aim.x - prev.x) * (0.08 + str * 0.18)
-local dy = (aim.y - prev.y) * (0.08 + str * 0.18)
-local dz = (aim.z - prev.z) * (0.08 + str * 0.18)
-overshoot.x = overshoot.x * 0.78 + dx
-overshoot.y = overshoot.y * 0.78 + dy
-overshoot.z = overshoot.z * 0.78 + dz
-else
-overshoot.x = overshoot.x * 0.7
-overshoot.y = overshoot.y * 0.7
-overshoot.z = overshoot.z * 0.7
-end
-return {
-x = aim.x + human_drift.x + overshoot.x,
-y = aim.y + human_drift.y + overshoot.y,
-z = aim.z + human_drift.z + overshoot.z,
-}
-end
-local function blend_aim(prev, nxt)
-if not nxt then return prev end
-local target = apply_humanize(nxt, prev)
-if not prev then return { x = target.x, y = target.y, z = target.z } end
-local a = smooth_alpha(prev, target)
-return {
-x = prev.x + (target.x - prev.x) * a,
-y = prev.y + (target.y - prev.y) * a,
-z = prev.z + (target.z - prev.z) * a,
-}
-end
-local function update_target(cx, cy, fov)
-local sticky = combat_menu.sticky_enabled(PREFIX)
-local holding = aiming()
-local now = tick_ms()
-if sticky then
-if was_aiming and not holding then
-locked_target = nil
-smoothed_aim = nil
-reset_humanize()
-targeting.clear_random_bone(PREFIX)
-end
-was_aiming = holding
-if not holding then
-if now - last_target_scan < TARGET_SCAN_MS then
-return
-end
-last_target_scan = now
-locked_target = targeting.find_target(cx, cy, fov, PREFIX)
-return
-end
-if locked_target and targeting.is_npc_target(locked_target) then
-locked_target = targeting.refresh_npc_target(locked_target)
-end
-if locked_target then
-if not targeting.is_target_valid(locked_target, PREFIX, cx, cy, fov, { ignore_fov = true }) then
-locked_target = nil
-smoothed_aim = nil
-reset_humanize()
-targeting.clear_random_bone(PREFIX)
-else
-return
-end
-end
-if now - last_target_scan < TARGET_SCAN_MS then
-return
-end
-last_target_scan = now
-local next_target = targeting.find_target(cx, cy, fov, PREFIX)
-if not targeting.same_target(next_target, locked_target) then
-targeting.clear_random_bone(PREFIX)
-end
-locked_target = next_target
-return
-end
-was_aiming = holding
-if locked_target and targeting.is_npc_target(locked_target) then
-locked_target = targeting.refresh_npc_target(locked_target)
-end
-if locked_target and not targeting.is_target_valid(locked_target, PREFIX, cx, cy, fov) then
-locked_target = nil
-smoothed_aim = nil
-reset_humanize()
-targeting.clear_random_bone(PREFIX)
-end
-last_target_scan = now
-local next_target = targeting.find_target(cx, cy, fov, PREFIX)
-if not targeting.same_target(next_target, locked_target) then
-targeting.clear_random_bone(PREFIX)
-end
-locked_target = next_target
-end
-local function resolve_aim_point(target, cx, cy)
-local auto_pred = settings.bool(PREFIX .. "auto_pred", true)
-local holding = holding_weapon()
-local predict_origin = combat_origin.get_camera_origin()
-or combat_origin.get_muzzle_origin()
-or combat_origin.get_fire_origin()
-local use_pred = auto_pred and holding
-return targeting.get_aim_point(target, PREFIX, nil, predict_origin, cx, cy, use_pred)
-end
-function M.register_menu()
-local G = menu_util.G
-local T, _ = menu_util.group(G.AIM)
-menu_util.register_keybind(T, G.AIM, P_MASTER, "Enable Aimbot", false)
-menu.add_combo(T, G, P_AIM_KEY_MODE, "Aim Key Mode", { "Always", "Hold", "Toggle" }, 1,
-{ parent = P_MASTER })
-if menu.add_hotkey then
-menu.add_hotkey(T, G, P_AIM_KEY, "Aim Key", 0, { parent = P_MASTER, default_mode = 1 })
-end
-if menu and menu.set_visible then
-pcall(menu.set_visible, P_AIM_KEY_MODE, false)
-end
-combat_menu.register_aimbot(T, G.AIM, PREFIX, P_MASTER, {
-fov_default = 120,
-fov_color = theme.GREEN or { 0.2, 1, 0.45, 1 },
-line_color = { 0.2, 1, 0.45, 1 },
-})
-menu_util.bind_children(P_MASTER, {
-P_MASTER .. "_mode",
-P_AIM_KEY, P_AIM_KEY_MODE,
-PREFIX .. "target_type", PREFIX .. "bone",
-PREFIX .. "filters",
-PREFIX .. "whitelist_ids", PREFIX .. "whitelist_clear",
-PREFIX .. "targets", PREFIX .. "sticky",
-PREFIX .. "auto_pred",
-PREFIX .. "smooth", PREFIX .. "smooth_type",
-PREFIX .. "humanize", PREFIX .. "humanize_str",
-PREFIX .. "draw_fov", PREFIX .. "fov_style", PREFIX .. "target_line",
-PREFIX .. "max_dist", PREFIX .. "fov",
-})
-menu_util.bind_children(PREFIX .. "humanize", {
-PREFIX .. "humanize_str",
-})
-menu_util.bind_children(PREFIX .. "draw_fov", {
-PREFIX .. "fov_style",
-})
-end
-function M.update(_dt)
-cached_aim = nil
-if not enabled() then
-locked_target = nil
-smoothed_aim = nil
-was_aiming = false
-fire_was_down = false
-last_random_shot_ms = 0
-reset_humanize()
-targeting.clear_random_bone(PREFIX)
-return
-end
-local sw, sh = targeting.screen_center()
-local cx, cy = sw * 0.5, sh * 0.5
-local fov = settings.num(PREFIX .. "fov", 120)
-update_target(cx, cy, fov)
-if holding_weapon() then
-combat_origin.sync_weapon(weapons.cached_held_ranged() or weapons.get_held_ranged_weapon_name())
-end
-local wl_target = locked_target
-if not wl_target or not targeting.is_aim_target(wl_target) then
-wl_target = targeting.find_target(cx, cy, fov, PREFIX, { ignore_whitelist = true })
-end
-silent_whitelist.tick(wl_target, PREFIX)
-if not locked_target or not targeting.is_aim_target(locked_target) then
-smoothed_aim = nil
-reset_humanize()
-fire_was_down = false
-last_random_shot_ms = 0
-return
-end
-tick_random_bone_while_firing(locked_target)
-local aim = resolve_aim_point(locked_target, cx, cy)
-if not aim then
-smoothed_aim = nil
-reset_humanize()
-return
-end
-if aiming() then
-smoothed_aim = blend_aim(smoothed_aim, aim)
-cached_aim = smoothed_aim
-if camera and camera.look_at then
-local smooth_frames = math.max(1, math.floor(settings.num(PREFIX .. "smooth", 10)))
-local style = math.floor(tonumber(settings.num(PREFIX .. "smooth_type", 0)) or 0)
-if style == SMOOTH_ADAPTIVE or style == SMOOTH_EXPONENTIAL then
-smooth_frames = math.max(1, math.floor(smooth_frames * 0.75))
-end
-local ok_r, rcs = pcall(April.require, "features.combat.recoil_control")
-local pre_p, pre_y = nil, nil
-if ok_r and rcs then pre_p, pre_y = rcs.angles() end
-pcall(camera.look_at, smoothed_aim.x, smoothed_aim.y, smoothed_aim.z, smooth_frames)
-if ok_r and rcs then rcs.script_move(pre_p, pre_y) end
-end
-else
-smoothed_aim = nil
-reset_humanize()
-cached_aim = aim
-end
-end
-function M.get_target()
-return locked_target
-end
-local scoped_cache = { t = 0, target = nil }
-function M.get_scoped_target()
-if locked_target then return locked_target end
-if not enabled() then
-scoped_cache.target = nil
-return nil
-end
-local now = tick_ms()
-if (now - (scoped_cache.t or 0)) < TARGET_SCAN_MS then
-return scoped_cache.target
-end
-scoped_cache.t = now
-local sw, sh = targeting.screen_center()
-local fov = settings.num(PREFIX .. "fov", 120)
-scoped_cache.target = targeting.find_target(sw * 0.5, sh * 0.5, fov, PREFIX)
-return scoped_cache.target
-end
-function M.draw()
-if not enabled() then return end
-local sw, sh = targeting.screen_center()
-local cx, cy = sw * 0.5, sh * 0.5
-local fov = settings.num(PREFIX .. "fov", 120)
-if settings.bool(PREFIX .. "draw_fov", false) then
-local col = settings.color(PREFIX .. "draw_fov", { 0.2, 1, 0.45, 1 })
-local filled = settings.num(PREFIX .. "fov_style", 1) == 1
-if filled and draw and draw.circle_filled then
-local fill = settings.color(PREFIX .. "draw_fov", { 0.2, 1, 0.45, 0.12 })
-local c = { fill[1], fill[2], fill[3], (fill[4] or 1) * 0.25 }
-draw.circle_filled(cx, cy, fov, c, 32)
-end
-if draw and draw.circle then
-draw.circle(cx, cy, fov, col, 32, 1)
-else
-draw_util.circle(cx, cy, fov, col, false)
-end
-end
-if locked_target and settings.bool(PREFIX .. "target_line", false) then
-local aim = cached_aim or smoothed_aim or resolve_aim_point(locked_target, cx, cy)
-if aim then
-local tx, ty, vis = w2s(aim.x, aim.y, aim.z)
-if vis then
-local col = settings.color(PREFIX .. "target_line", { 0.2, 1, 0.45, 1 })
-draw_util.line(cx, cy, tx, ty, col, 1.5)
-end
-end
-end
-end
-return M
-end)()
-
 April._mods["features.combat.recoil_control"] = (function()
 -- Recoil Control: while you fire a gun, cancels recoil and nothing else.
 --   camera movement - your mouse movement - script turns (aimbot) = recoil
@@ -16404,6 +16882,12 @@ function M.register_menu()
     local T = menu_util.group(G.AIM)
     menu_util.register_keybind(T, G.AIM, "april_rcs_enabled", "Recoil Control", false)
 end
+-- Shots April fires itself (ragebot Auto Fire) never show as left click held, so the ragebot
+-- reports each shot here (at the gun's own fire rate) and they are treated exactly like yours.
+function M.note_fire(now)
+    now = tonumber(now) or now_ms()
+    if now + AFTER_FIRE_MS > st.fire_end then st.fire_end = now + AFTER_FIRE_MS end
+end
 function M.update(_dt) end
 function M.draw()
     local now = now_ms()
@@ -16487,6 +16971,7 @@ local silent_ray = April.require("core.silent_ray")
 local M = {}
 local P = "april_farm_helper"
 local P_RADIUS = "april_farm_radius"
+local P_ROTATION = "april_farm_rotation"
 local SHOOT_VK = 0x01
 local TARGET_SCAN_MS = 75
 local TOOL_CACHE_MS = 150
@@ -16644,6 +17129,30 @@ function M.update(_dt)
         SHOOT_VK,
         locked_target.pos
     ) == true
+    if M._tracking then
+        -- Camera assist (Rotation Speed %): 100% = instant, 1% = slowest. Mirrors the
+        -- manual farm helper so the visible camera follows the swing target.
+        local aim = locked_target.weak_pos
+        if not aim then
+            aim = locked_target.pos
+            if locked_target.kind == "Trees" then
+                local ok, cam = pcall(function()
+                    local fn = camera and (camera.get_position or camera.GetPosition)
+                    local p = fn and fn()
+                    return p and (p.Y or p.y)
+                end)
+                if ok and cam and aim then aim = { x = aim.x, y = cam, z = aim.z } end
+            end
+        end
+        if aim then
+            local pct = math.max(1, math.min(100, settings.num(P_ROTATION, 90)))
+            local smooth = 1 + (100 - pct) / 99 * 19
+            local look = camera and (camera.look_at or camera.LookAt)
+            if type(look) == "function" then
+                pcall(look, aim.x, aim.y, aim.z, smooth)
+            end
+        end
+    end
     if not M._tracking then silent_ray.stop() end
 end
 function M.get_target()
@@ -16670,6 +17179,7 @@ D.P = "april_autofarm"
 D.P_RESOURCES = D.P .. "_resources"
 D.P_SEARCH = D.P .. "_search_range"
 D.P_DEBUG = D.P .. "_debug_path"
+D.P_ROTATION = D.P .. "_rotation"
 D.VK = {
 LMB = 0x01,
 SHIFT = 0x10,
@@ -16969,10 +17479,15 @@ D.event("target_lock key=" .. tostring(record.key)
 .. " reason=" .. tostring(reason))
 D.set_phase(D.PHASE.APPROACH, reason)
 end
-function D.look_at(point, smooth)
+-- Rotation Speed slider: 100% = instant (look_at smooth 1), 1% = slowest (smooth 20).
+function D.rotation_smooth()
+local pct = math.max(1, math.min(100, D.settings.num(D.P_ROTATION, 90)))
+return 1 + (100 - pct) / 99 * 19
+end
+function D.look_at(point, _smooth)
 local fn = camera and (camera.look_at or camera.LookAt)
 if type(fn) ~= "function" or not point then return false end
-return pcall(fn, point.x, point.y, point.z, smooth or 1)
+return pcall(fn, point.x, point.y, point.z, D.rotation_smooth())
 end
 function D.alignment(camera_pos, point)
 local fn = camera and (camera.get_look_vector or camera.GetLookVector)
@@ -17769,427 +18284,7 @@ end
 return M
 end)()
 
-April._mods["features.utility.mod_checker"] = (function()
-local settings = April.require("core.settings")
-local notify = April.require("core.notify")
-local mod_ids = April.require("game.mod_ids")
-local menu_util = April.require("core.menu_util")
-local draw_util = April.require("core.draw_util")
-local env = April.require("core.env")
-local esp_util = April.require("core.esp_util")
-local theme = April.require("core.ui_theme")
-local panel_drag = April.require("core.panel_drag")
-local overlay_theme = April.require("core.overlay_theme")
-local ep = April.require("core.entity_props")
-local M = {}
-local P = "april_mod_checker_enabled"
-local X_ID = "april_mod_checker_x"
-local Y_ID = "april_mod_checker_y"
-local PANEL_W = 282
-local HEAD_OFFSET = 3.5
-local TITLE_H = 30
-local SCAN_MS = 2500
-local META_REFRESH_MS = 1000
-local LOOKUP_BUDGET = 2
-local ROLE_MISS_TTL_MS = 3000
-local seen = {}
-local active = {}
-local role_misses = {}
-local settled_nonstaff = {}
-local panel_rows = {}
-local last_scan = -1
-local last_meta_refresh = 0
-local last_progressive = 0
-local PROGRESSIVE_MS = 100
-M._session = nil
-M._was_enabled = false
-M._group_started = false
-local function tick_ms()
-return utility and utility.get_tick_count and utility.get_tick_count() or 0
-end
-local function session_id()
-if not game then return "none" end
-local pid = game.place_id or 0
-local ws = game.workspace
-local ws_addr = (ws and (ws.Address or ws.address)) or 0
-local job = (game.job_id or game.JobId or "")
-return tostring(pid) .. ":" .. tostring(ws_addr) .. ":" .. tostring(job)
-end
-local function player_uid(p)
-local uid = ep.user_id(p)
-if uid and uid ~= 0 then return uid end
-return p.name or p.display_name
-end
-function M.reset_state()
-seen = {}
-active = {}
-role_misses = {}
-settled_nonstaff = {}
-panel_rows = {}
-last_scan = -1
-last_meta_refresh = 0
-last_progressive = 0
-end
-function M.on_session_changed()
-M.reset_state()
-mod_ids.reset_session()
-M._group_started = false
-end
-function M.tick_session()
-local sid = session_id()
-if M._session == nil then
-M._session = sid
-last_scan = -1
-return
-end
-if sid ~= M._session then
-M._session = sid
-M.on_session_changed()
-end
-end
-local function player_label(p)
-if not p then return "Unknown" end
-if p.display_name and p.display_name ~= "" then return p.display_name end
-return p.name or "Unknown"
-end
-local function format_duration(ms)
-ms = math.max(0, ms or 0)
-local sec = math.floor(ms / 1000)
-if sec < 60 then return sec .. "s" end
-local min = math.floor(sec / 60)
-sec = sec % 60
-if min < 60 then return string.format("%dm %02ds", min, sec) end
-local hr = math.floor(min / 60)
-min = min % 60
-return string.format("%dh %02dm", hr, min)
-end
-local function head_world_pos(p)
-if p.head_position then
-local hp = p.head_position
-if type(hp) == "table" then
-if hp.x then return hp.x, hp.y + HEAD_OFFSET, hp.z end
-return hp[1], (hp[2] or 0) + HEAD_OFFSET, hp[3]
-end
-end
-if p.position then
-local pos = p.position
-return pos.x, pos.y + HEAD_OFFSET + 1.5, pos.z
-end
-return nil
-end
-function M.register_menu()
-local G = menu_util.G
-local T, _ = menu_util.group(G.MISC)
-local root = menu_util.parent(P)
-menu_util.section(T, G.MISC, "Utility")
-menu.add_checkbox(T, G.MISC, P, "Mod Checker", false)
-menu_util.section(T, G.MISC, "Mod Checker Scan")
-menu.add_slider_int(T, G.MISC, "april_mod_checker_interval", "Scan Interval (ms)", 1000, 10000, 2500, root)
-pcall(function()
-local gs = April.require("ui.gs_state")
-gs.define(X_ID, -1)
-gs.define(Y_ID, -1)
-end)
-menu_util.bind_master(P, { "april_mod_checker_interval" })
-end
-function M.init()
-M.on_session_changed()
-M._session = session_id()
-M._group_started = false
-end
-function M.track_player(p, role)
-local uid = player_uid(p)
-if not uid or uid == "" then return end
-local now = tick_ms()
-if not active[uid] then
-active[uid] = {
-uid = uid,
-label = player_label(p),
-username = p.name or "?",
-role = role,
-first_seen = now,
-player = p,
-}
-else
-local entry = active[uid]
-entry.label = player_label(p)
-entry.username = p.name or entry.username
-entry.role = role
-entry.player = p
-end
-end
-local function numeric_uid(p)
-return ep.user_id(p)
-end
-function M.check_player(p, lookup_budget)
-if not settings.enabled(P) then return lookup_budget end
-if not p or p.is_local then return lookup_budget end
-local uid_num = numeric_uid(p)
-if uid_num and settled_nonstaff[uid_num] then
-return lookup_budget
-end
-local role = mod_ids.role_for_player(p, {
-queue_lookup = true,
-mark_unknown = false,
-live_lookup = true,
-})
-if not role then
-if uid_num then
-settled_nonstaff[uid_num] = true
-end
-return lookup_budget
-end
-local uid = player_uid(p)
-if not uid or uid == "" then return lookup_budget end
-if uid_num then settled_nonstaff[uid_num] = nil end
-M.track_player(p, role)
-if seen[uid] then return lookup_budget end
-seen[uid] = true
-notify.warning(string.format("%s: %s (%s)", mod_ids.short_label(role), player_label(p), p.name or "?"), 6000)
-rebuild_panel_rows(tick_ms())
-return lookup_budget
-end
-local function rebuild_panel_rows(now)
-local rows = {}
-local me = env.get_local_player()
-for uid, entry in pairs(active) do
-local p = entry.player
-local dist = nil
-if p and me and me.position and p.position then
-local dx = p.position.x - me.position.x
-local dy = p.position.y - me.position.y
-local dz = p.position.z - me.position.z
-dist = math.floor(math.sqrt(dx * dx + dy * dy + dz * dz))
-end
-local meta = format_duration(now - (entry.first_seen or now))
-if dist then
-meta = meta .. "  |  " .. dist .. "m"
-end
-rows[#rows + 1] = {
-name = entry.label or entry.username or "Unknown",
-role = mod_ids.short_label(entry.role),
-meta = meta,
-first_seen = entry.first_seen or now,
-accent = theme.role_accent(entry.role),
-}
-end
-table.sort(rows, function(a, b)
-return (a.first_seen or 0) < (b.first_seen or 0)
-end)
-panel_rows = rows
-end
-local function player_body_alive(p)
-if not p or p.is_local then return false end
-if p.is_alive == false then return false end
-local char = p.character
-if not char or not env.is_valid(char) then return false end
-local hum = p.humanoid
-if hum ~= nil and not env.is_valid(hum) then return false end
-if p.health ~= nil and p.health <= 0 then return false end
-return true
-end
-function M.reconcile_active(players)
-local present = {}
-for _, p in ipairs(players) do
-if p.is_local then goto continue end
-local role = mod_ids.role_for_player(p, { live_lookup = true })
-if not role then goto continue end
-local uid = player_uid(p)
-if not uid or uid == "" then goto continue end
-present[uid] = true
-if player_body_alive(p) then
-M.track_player(p, role)
-elseif active[uid] then
-active[uid].player = nil
-active[uid].role = role
-else
-M.track_player(p, role)
-if active[uid] then active[uid].player = nil end
-end
-::continue::
-end
-for uid in pairs(active) do
-if not present[uid] then
-active[uid] = nil
-seen[uid] = nil
-end
-end
-end
-function M.scan_progressive()
-if not settings.enabled(P) then return end
-local players = April.require("core.cache").players
-local lookup_budget = LOOKUP_BUDGET
-for _, p in ipairs(players) do
-local uid = player_uid(p)
-if uid and seen[uid] then
-goto continue
-end
-lookup_budget = M.check_player(p, lookup_budget)
-::continue::
-end
-last_meta_refresh = tick_ms()
-end
-function M.scan_all()
-if not settings.enabled(P) then return end
-local players = April.require("core.cache").players
-local lookup_budget = LOOKUP_BUDGET
-settled_nonstaff = {}
-M.reconcile_active(players)
-for _, p in ipairs(players) do
-lookup_budget = M.check_player(p, lookup_budget)
-end
-rebuild_panel_rows(tick_ms())
-last_meta_refresh = tick_ms()
-end
-function M.on_player_added(p)
-local uid_num = numeric_uid(p)
-if uid_num then settled_nonstaff[uid_num] = nil end
-M.check_player(p, LOOKUP_BUDGET)
-rebuild_panel_rows(tick_ms())
-end
-function M.on_player_removed(p)
-if not p then return end
-local uid = player_uid(p)
-local uid_num = numeric_uid(p)
-if uid_num then settled_nonstaff[uid_num] = nil end
-if uid and uid ~= "" then
-seen[uid] = nil
-active[uid] = nil
-role_misses[uid] = nil
-mod_ids.invalidate_player(p)
-rebuild_panel_rows(tick_ms())
-end
-end
-function M.staff_role(player)
-if not player then return nil end
-local uid = player_uid(player)
-if uid and active[uid] then
-return active[uid].role
-end
-local now = tick_ms()
-if uid and now < (role_misses[uid] or 0) then return nil end
-local role = mod_ids.role_for_player(player, { live_lookup = true })
-if uid and not role then role_misses[uid] = now + ROLE_MISS_TTL_MS end
-return role
-end
-function M.is_staff(player)
-return M.staff_role(player) ~= nil
-end
-function M.update(_dt)
-M.tick_session()
-if not settings.enabled(P) then
-if M._was_enabled then
-M.reset_state()
-mod_ids.stop("mod_checker_disabled")
-M._group_started = false
-end
-M._was_enabled = false
-return
-end
-local just_enabled = not M._was_enabled
-M._was_enabled = true
-if not M._group_started then
-M._group_started = mod_ids.ensure_started() == true
-end
-local now = tick_ms()
-if just_enabled or last_progressive < 0 or (now - last_progressive) >= PROGRESSIVE_MS then
-last_progressive = now
-M.scan_progressive()
-end
-local interval = settings.num("april_mod_checker_interval", SCAN_MS)
-if last_scan < 0 or (now - last_scan) >= interval then
-last_scan = now
-M.scan_all()
-end
-end
-function M.draw_mod_markers()
-if not settings.enabled(P) then return end
-for uid, entry in pairs(active) do
-local p = entry.player
-if not player_body_alive(p) then
-if p and (p.is_alive == false or not p.character or not env.is_valid(p.character)) then
-entry.player = nil
-end
-goto continue
-end
-local wx, wy, wz = head_world_pos(p)
-if not wx then goto continue end
-local sx, sy, vis = esp_util.w2s(wx, wy, wz)
-if not vis then goto continue end
-theme.draw_staff_badge(sx, sy, entry.role)
-::continue::
-end
-end
-local function draw_staff_panel(x, y, width, rows)
-if not draw or not draw.text then return end
-local pad = 12
-local row_h = 38
-local count = math.max(#rows, 1)
-local height = TITLE_H + count * row_h + 6
-local i18n = April.require("ui.i18n")
-local title = i18n.t("STAFF IN LOBBY")
-if #rows > 1 then
-title = title .. " (" .. #rows .. ")"
-end
-overlay_theme.draw_panel(x, y, width, height, title)
-local ry = y + TITLE_H + 5
-if #rows == 0 then
-draw.text(x + pad, ry + 2, i18n.t("No staff detected"), theme.TEXT_MUTED, 11)
-return height
-end
-local max_name = math.max(10, math.floor((width - pad * 2 - 12) / 7))
-for i = 1, #rows do
-local row = rows[i]
-local row_accent = row.accent or theme.role_accent(row.role)
-local name = row.name or "?"
-if #name > max_name then name = name:sub(1, math.max(1, max_name - 2)) .. ".." end
-draw.text(x + pad, ry + 1, name, theme.TEXT, 12)
-local role = row.role or "Staff"
-if #role > max_name then role = role:sub(1, math.max(1, max_name - 2)) .. ".." end
-local role_w = theme.text_w(role, 10)
-draw.text(x + width - pad - role_w, ry + 2, role, row_accent, 10)
-if row.meta and row.meta ~= "" then
-draw.text(x + pad, ry + 18, row.meta, theme.TEXT_MUTED, 10)
-end
-ry = ry + row_h
-end
-return height
-end
-function M.draw()
-M.draw_mod_markers()
-if not settings.enabled(P) then return end
-local now = tick_ms()
-if now - last_meta_refresh >= META_REFRESH_MS then
-rebuild_panel_rows(now)
-last_meta_refresh = now
-end
-local sw, sh = draw_util.screen_size()
-local row_h = 38
-local count = math.max(#panel_rows, 1)
-local height = TITLE_H + count * row_h + 6
-local default_x = sw - PANEL_W - 16
-local default_y = 72
-local stored_x = settings.num(X_ID, -1)
-local stored_y = settings.num(Y_ID, -1)
-if stored_x < 0 then
-if menu and menu.set then pcall(menu.set, X_ID, default_x) end
-end
-if stored_y < 0 then
-if menu and menu.set then pcall(menu.set, Y_ID, default_y) end
-end
-local x, y = panel_drag.update(
-"mod_checker",
-X_ID, Y_ID,
-PANEL_W, TITLE_H,
-sw, sh,
-default_x, default_y,
-true
-)
-x, y = panel_drag.clamp(x, y, PANEL_W, height, sw, sh, X_ID, Y_ID)
-draw_staff_panel(x, y, PANEL_W, panel_rows)
-end
-return M
-end)()
+
 
 April._mods["features.utility.event_status"] = (function()
 local settings = April.require("core.settings")
@@ -18540,7 +18635,7 @@ function M.register_menu()
 local G = menu_util.G
 local T = menu_util.group(G.MISC)
 local root = menu_util.parent(P)
-menu.add_checkbox(T, G.MISC, P, "Event Status", false)
+menu_util.register_keybind(T, G.MISC, P, "Event Status", false)
 menu.add_checkbox(T, G.MISC, "april_event_status_active_only", "Only Show Active Events", false, root)
 menu.add_checkbox(T, G.MISC, "april_event_status_notify", "Event Notifications", true, root)
 menu.add_checkbox(T, G.MISC, "april_event_status_distance", "Show Event Distance", true, root)
@@ -18593,6 +18688,550 @@ local status_w = theme.text_w(row.status, 9)
 draw_util.text(x + PANEL_W - 12 - status_w, ry + 2, row.status, col, 9)
 ry = ry + ROW_H
 end
+end
+return M
+end)()
+
+April._mods["features.utility.mod_checker"] = (function()
+local settings = April.require("core.settings")
+local notify = April.require("core.notify")
+local mod_ids = April.require("game.mod_ids")
+local menu_util = April.require("core.menu_util")
+local draw_util = April.require("core.draw_util")
+local env = April.require("core.env")
+local esp_util = April.require("core.esp_util")
+local theme = April.require("core.ui_theme")
+local panel_drag = April.require("core.panel_drag")
+local overlay_theme = April.require("core.overlay_theme")
+local ep = April.require("core.entity_props")
+local M = {}
+local P = "april_mod_checker_enabled"
+local X_ID = "april_mod_checker_x"
+local Y_ID = "april_mod_checker_y"
+local PANEL_W = 282
+local HEAD_OFFSET = 3.5
+local TITLE_H = 30
+local SCAN_MS = 2500
+local META_REFRESH_MS = 1000
+local LOOKUP_BUDGET = 2
+local ROLE_MISS_TTL_MS = 3000
+local seen = {}
+local active = {}
+local role_misses = {}
+local settled_nonstaff = {}
+local panel_rows = {}
+local last_scan = -1
+local last_meta_refresh = 0
+local last_progressive = 0
+local PROGRESSIVE_MS = 100
+M._session = nil
+M._was_enabled = false
+M._group_started = false
+local function tick_ms()
+return utility and utility.get_tick_count and utility.get_tick_count() or 0
+end
+-- Server identity. The job id is used when readable; the workspace address only as a
+-- fallback, since a one-off bad read of it used to wipe the whole staff list.
+local function session_id()
+if not game then return nil end
+local pid, job, ws_addr = 0, "", 0
+pcall(function() pid = game.place_id or game.PlaceId or 0 end)
+pcall(function() job = game.job_id or game.JobId or "" end)
+pcall(function()
+local ws = game.workspace
+ws_addr = (ws and (ws.Address or ws.address)) or 0
+end)
+if job ~= "" then
+M._job_seen = true
+return tostring(pid) .. ":" .. tostring(job)
+end
+if M._job_seen or ws_addr == 0 then return nil end
+return tostring(pid) .. ":ws" .. tostring(ws_addr)
+end
+local function player_uid(p)
+local uid = ep.user_id(p)
+if uid and uid ~= 0 then return uid end
+return p.name or p.display_name
+end
+local ROSTER_MS = 1000
+-- Staff stay listed until they are missing from a good Players-list read for this long.
+local GONE_MS = 5000
+local SESSION_CONFIRM_MS = 3000
+local roster = {}
+local roster_at = nil
+local roster_ok = false
+local roster_ever_ok = false
+local roster_ids = {}
+-- Fallback only if this setup can never read the Players list.
+local GONE_FALLBACK_MS = 60000
+local missing_since = {}
+local pending_session, pending_since = nil, 0
+local rebuild_panel_rows
+local function players_service()
+local svc = nil
+pcall(function() svc = game.Players or game.players end)
+if svc then return svc end
+pcall(function() svc = game.GetService("Players") end)
+if svc then return svc end
+pcall(function() svc = game:GetService("Players") end)
+return svc
+end
+-- A Players-service entry as a plain table the rest of the checker understands.
+local function wrap_player(inst)
+if type(inst) == "table" and (inst.name or inst.user_id) then return inst end
+local ok, info = pcall(function()
+return { name = inst.Name, display_name = inst.DisplayName, UserId = inst.UserId }
+end)
+if not ok or not info or not info.name then return nil end
+info.user_id = info.UserId
+info._inst = inst
+return info
+end
+-- Everyone in the server comes from the Players list. entity.GetPlayers only holds players
+-- whose characters are loaded near you, so staff far away were only found once you got
+-- close to them. Loaded players are used as-is so distance and the head badge still work.
+local function refresh_roster(force)
+local now = tick_ms()
+if not force and roster_at and now - roster_at < ROSTER_MS then return roster end
+roster_at = now
+local loaded = {}
+for _, p in ipairs(April.require("core.cache").players or {}) do
+local uid = ep.user_id(p)
+if uid then loaded[uid] = p end
+end
+local out, have = {}, {}
+local lp = game and (game.LocalPlayer or game.local_player)
+local my_uid = nil
+pcall(function() my_uid = tonumber(lp.UserId) end)
+local svc = players_service()
+local ok, list = pcall(function() return svc:GetPlayers() end)
+if not ok or type(list) ~= "table" or #list == 0 then
+ok, list = pcall(function() return svc:GetChildren() end)
+end
+local read = 0
+for _, inst in ipairs((ok and type(list) == "table") and list or {}) do
+local w = wrap_player(inst)
+local uid = w and tonumber(w.UserId or w.user_id)
+if uid and uid ~= 0 then read = read + 1 end
+if uid and uid ~= 0 and uid ~= my_uid and not have[uid] then
+have[uid] = true
+out[#out + 1] = loaded[uid] or w
+end
+end
+-- A read that returned nobody (not even you) failed; it must not count as everyone leaving.
+roster_ok = read > 0
+if roster_ok then
+roster_ids = have
+roster_ever_ok = true
+end
+for uid, p in pairs(loaded) do
+if not have[uid] then out[#out + 1] = p end
+end
+roster = out
+return out
+end
+local function loaded_entity(uid)
+for _, p in ipairs(April.require("core.cache").players or {}) do
+if player_uid(p) == uid then return p end
+end
+return nil
+end
+function M.reset_state()
+seen = {}
+active = {}
+role_misses = {}
+settled_nonstaff = {}
+panel_rows = {}
+last_scan = -1
+last_meta_refresh = 0
+last_progressive = 0
+roster = {}
+roster_at = nil
+roster_ok = false
+roster_ids = {}
+missing_since = {}
+end
+function M.on_session_changed()
+M.reset_state()
+mod_ids.reset_session()
+M._group_started = false
+end
+-- A new server only counts once the new id has read the same for a few seconds, so a
+-- glitched read can't clear the staff list.
+function M.tick_session()
+local sid = session_id()
+if not sid then return end
+if M._session == nil then
+M._session = sid
+last_scan = -1
+return
+end
+if sid == M._session then
+pending_session = nil
+return
+end
+local now = tick_ms()
+if pending_session ~= sid then
+pending_session, pending_since = sid, now
+return
+end
+if now - pending_since >= SESSION_CONFIRM_MS then
+pending_session = nil
+M._session = sid
+M.on_session_changed()
+end
+end
+local function player_label(p)
+if not p then return "Unknown" end
+if p.display_name and p.display_name ~= "" then return p.display_name end
+return p.name or "Unknown"
+end
+local function format_duration(ms)
+ms = math.max(0, ms or 0)
+local sec = math.floor(ms / 1000)
+if sec < 60 then return sec .. "s" end
+local min = math.floor(sec / 60)
+sec = sec % 60
+if min < 60 then return string.format("%dm %02ds", min, sec) end
+local hr = math.floor(min / 60)
+min = min % 60
+return string.format("%dh %02dm", hr, min)
+end
+local function head_world_pos(p)
+if p.head_position then
+local hp = p.head_position
+if type(hp) == "table" then
+if hp.x then return hp.x, hp.y + HEAD_OFFSET, hp.z end
+return hp[1], (hp[2] or 0) + HEAD_OFFSET, hp[3]
+end
+end
+if p.position then
+local pos = p.position
+return pos.x, pos.y + HEAD_OFFSET + 1.5, pos.z
+end
+return nil
+end
+function M.register_menu()
+local G = menu_util.G
+local T, _ = menu_util.group(G.MISC)
+local root = menu_util.parent(P)
+menu_util.section(T, G.MISC, "Utility")
+menu.add_checkbox(T, G.MISC, P, "Mod Checker", false)
+menu_util.section(T, G.MISC, "Mod Checker Scan")
+menu.add_slider_int(T, G.MISC, "april_mod_checker_interval", "Scan Interval (ms)", 1000, 10000, 2500, root)
+pcall(function()
+local gs = April.require("ui.gs_state")
+gs.define(X_ID, -1)
+gs.define(Y_ID, -1)
+end)
+menu_util.bind_master(P, { "april_mod_checker_interval" })
+end
+function M.init()
+M.on_session_changed()
+M._session = session_id()
+M._group_started = false
+end
+function M.track_player(p, role)
+local uid = player_uid(p)
+if not uid or uid == "" then return end
+local now = tick_ms()
+if not active[uid] then
+active[uid] = {
+uid = uid,
+label = player_label(p),
+username = p.name or "?",
+role = role,
+first_seen = now,
+player = p,
+}
+else
+local entry = active[uid]
+entry.label = player_label(p)
+entry.username = p.name or entry.username
+entry.role = role
+entry.player = p
+end
+end
+local function numeric_uid(p)
+return ep.user_id(p)
+end
+function M.check_player(p, lookup_budget)
+if not settings.enabled(P) then return lookup_budget end
+if not p or p.is_local then return lookup_budget end
+local uid_num = numeric_uid(p)
+if uid_num and settled_nonstaff[uid_num] then
+return lookup_budget
+end
+local role = mod_ids.role_for_player(p, {
+queue_lookup = true,
+mark_unknown = false,
+live_lookup = true,
+})
+if not role then
+if uid_num then
+settled_nonstaff[uid_num] = true
+end
+return lookup_budget
+end
+local uid = player_uid(p)
+if not uid or uid == "" then return lookup_budget end
+if uid_num then settled_nonstaff[uid_num] = nil end
+M.track_player(p, role)
+if seen[uid] then return lookup_budget end
+seen[uid] = true
+notify.warning(string.format("%s: %s (%s)", mod_ids.short_label(role), player_label(p), p.name or "?"), 6000)
+rebuild_panel_rows(tick_ms())
+return lookup_budget
+end
+function rebuild_panel_rows(now)
+local rows = {}
+local me = env.get_local_player()
+for uid, entry in pairs(active) do
+local p = loaded_entity(uid) or entry.player
+local dist = nil
+if p and me and me.position and p.position then
+local dx = p.position.x - me.position.x
+local dy = p.position.y - me.position.y
+local dz = p.position.z - me.position.z
+dist = math.floor(math.sqrt(dx * dx + dy * dy + dz * dz))
+end
+local meta = format_duration(now - (entry.first_seen or now))
+if dist then
+meta = meta .. "  |  " .. dist .. "m"
+end
+rows[#rows + 1] = {
+name = entry.label or entry.username or "Unknown",
+role = mod_ids.short_label(entry.role),
+meta = meta,
+first_seen = entry.first_seen or now,
+accent = theme.role_accent(entry.role),
+}
+end
+table.sort(rows, function(a, b)
+return (a.first_seen or 0) < (b.first_seen or 0)
+end)
+panel_rows = rows
+end
+local function player_body_alive(p)
+if not p or p.is_local then return false end
+if p.is_alive == false then return false end
+local char = p.character
+if not char or not env.is_valid(char) then return false end
+local hum = p.humanoid
+if hum ~= nil and not env.is_valid(hum) then return false end
+if p.health ~= nil and p.health <= 0 then return false end
+return true
+end
+local function drop_staff(uid)
+active[uid] = nil
+seen[uid] = nil
+role_misses[uid] = nil
+missing_since[uid] = nil
+end
+-- Once someone is found as staff they stay listed until they are missing from the server's
+-- Players list (a good read) for GONE_MS. A failed list read, a role lookup that comes back
+-- empty, or their character unloading out of range no longer removes them.
+function M.reconcile_active(players)
+local by_uid = {}
+for _, p in ipairs(players) do
+local uid = player_uid(p)
+if uid and uid ~= "" then by_uid[uid] = p end
+end
+local now = tick_ms()
+for uid, entry in pairs(active) do
+local p = by_uid[uid]
+if p then
+missing_since[uid] = nil
+entry.player = player_body_alive(p) and p or nil
+entry.label = player_label(p) ~= "Unknown" and player_label(p) or entry.label
+local role = mod_ids.role_for_player(p, { live_lookup = true })
+if role then entry.role = role end
+elseif roster_ok and not roster_ids[uid] then
+missing_since[uid] = missing_since[uid] or now
+if now - missing_since[uid] >= GONE_MS then drop_staff(uid) end
+elseif not roster_ever_ok then
+missing_since[uid] = missing_since[uid] or now
+if now - missing_since[uid] >= GONE_FALLBACK_MS then drop_staff(uid) end
+end
+end
+end
+function M.scan_progressive()
+if not settings.enabled(P) then return end
+local players = refresh_roster(false)
+local lookup_budget = LOOKUP_BUDGET
+for _, p in ipairs(players) do
+local uid = player_uid(p)
+if uid and seen[uid] then
+goto continue
+end
+lookup_budget = M.check_player(p, lookup_budget)
+::continue::
+end
+last_meta_refresh = tick_ms()
+end
+function M.scan_all()
+if not settings.enabled(P) then return end
+local players = refresh_roster(true)
+local lookup_budget = LOOKUP_BUDGET
+settled_nonstaff = {}
+M.reconcile_active(players)
+for _, p in ipairs(players) do
+lookup_budget = M.check_player(p, lookup_budget)
+end
+rebuild_panel_rows(tick_ms())
+last_meta_refresh = tick_ms()
+end
+function M.on_player_added(p)
+p = wrap_player(p) or p
+roster_at = nil
+local uid_num = numeric_uid(p)
+if uid_num then settled_nonstaff[uid_num] = nil end
+M.check_player(p, LOOKUP_BUDGET)
+rebuild_panel_rows(tick_ms())
+end
+-- Vector can report a player as removed when their character just unloads out of range, so
+-- staff are only dropped if the Players list confirms they are gone.
+function M.on_player_removed(p)
+if not p then return end
+p = wrap_player(p) or p
+local uid = player_uid(p)
+local uid_num = numeric_uid(p)
+if uid_num then settled_nonstaff[uid_num] = nil end
+if not uid or uid == "" then return end
+refresh_roster(true)
+if roster_ok and not roster_ids[uid] then
+drop_staff(uid)
+mod_ids.invalidate_player(p)
+rebuild_panel_rows(tick_ms())
+end
+end
+function M.staff_role(player)
+if not player then return nil end
+local uid = player_uid(player)
+if uid and active[uid] then
+return active[uid].role
+end
+local now = tick_ms()
+if uid and now < (role_misses[uid] or 0) then return nil end
+local role = mod_ids.role_for_player(player, { live_lookup = true })
+if uid and not role then role_misses[uid] = now + ROLE_MISS_TTL_MS end
+return role
+end
+function M.is_staff(player)
+return M.staff_role(player) ~= nil
+end
+function M.update(_dt)
+M.tick_session()
+if not settings.enabled(P) then
+if M._was_enabled then
+M.reset_state()
+mod_ids.stop("mod_checker_disabled")
+M._group_started = false
+end
+M._was_enabled = false
+return
+end
+local just_enabled = not M._was_enabled
+M._was_enabled = true
+if not M._group_started then
+M._group_started = mod_ids.ensure_started() == true
+end
+local now = tick_ms()
+if just_enabled or last_progressive < 0 or (now - last_progressive) >= PROGRESSIVE_MS then
+last_progressive = now
+M.scan_progressive()
+end
+local interval = settings.num("april_mod_checker_interval", SCAN_MS)
+if last_scan < 0 or (now - last_scan) >= interval then
+last_scan = now
+M.scan_all()
+end
+end
+function M.draw_mod_markers()
+if not settings.enabled(P) then return end
+for uid, entry in pairs(active) do
+local p = loaded_entity(uid) or entry.player
+if not player_body_alive(p) then
+if p and (p.is_alive == false or not p.character or not env.is_valid(p.character)) then
+entry.player = nil
+end
+goto continue
+end
+local wx, wy, wz = head_world_pos(p)
+if not wx then goto continue end
+local sx, sy, vis = esp_util.w2s(wx, wy, wz)
+if not vis then goto continue end
+theme.draw_staff_badge(sx, sy, entry.role)
+::continue::
+end
+end
+local function draw_staff_panel(x, y, width, rows)
+if not draw or not draw.text then return end
+local pad = 12
+local row_h = 38
+local count = math.max(#rows, 1)
+local height = TITLE_H + count * row_h + 6
+local i18n = April.require("ui.i18n")
+local title = i18n.t("STAFF IN LOBBY")
+if #rows > 1 then
+title = title .. " (" .. #rows .. ")"
+end
+overlay_theme.draw_panel(x, y, width, height, title)
+local ry = y + TITLE_H + 5
+if #rows == 0 then
+draw.text(x + pad, ry + 2, i18n.t("No staff detected"), theme.TEXT_MUTED, 11)
+return height
+end
+local max_name = math.max(10, math.floor((width - pad * 2 - 12) / 7))
+for i = 1, #rows do
+local row = rows[i]
+local row_accent = row.accent or theme.role_accent(row.role)
+local name = row.name or "?"
+if #name > max_name then name = name:sub(1, math.max(1, max_name - 2)) .. ".." end
+draw.text(x + pad, ry + 1, name, theme.TEXT, 12)
+local role = row.role or "Staff"
+if #role > max_name then role = role:sub(1, math.max(1, max_name - 2)) .. ".." end
+local role_w = theme.text_w(role, 10)
+draw.text(x + width - pad - role_w, ry + 2, role, row_accent, 10)
+if row.meta and row.meta ~= "" then
+draw.text(x + pad, ry + 18, row.meta, theme.TEXT_MUTED, 10)
+end
+ry = ry + row_h
+end
+return height
+end
+function M.draw()
+M.draw_mod_markers()
+if not settings.enabled(P) then return end
+local now = tick_ms()
+if now - last_meta_refresh >= META_REFRESH_MS then
+rebuild_panel_rows(now)
+last_meta_refresh = now
+end
+local sw, sh = draw_util.screen_size()
+local row_h = 38
+local count = math.max(#panel_rows, 1)
+local height = TITLE_H + count * row_h + 6
+local default_x = sw - PANEL_W - 16
+local default_y = 72
+local stored_x = settings.num(X_ID, -1)
+local stored_y = settings.num(Y_ID, -1)
+if stored_x < 0 then
+if menu and menu.set then pcall(menu.set, X_ID, default_x) end
+end
+if stored_y < 0 then
+if menu and menu.set then pcall(menu.set, Y_ID, default_y) end
+end
+local x, y = panel_drag.update(
+"mod_checker",
+X_ID, Y_ID,
+PANEL_W, TITLE_H,
+sw, sh,
+default_x, default_y,
+true
+)
+x, y = panel_drag.clamp(x, y, PANEL_W, height, sw, sh, X_ID, Y_ID)
+draw_staff_panel(x, y, PANEL_W, panel_rows)
 end
 return M
 end)()
@@ -19230,7 +19869,7 @@ local function held_piece(held)
 end
 local function split_words(text)
     local words = {}
-    for word in text:gmatch("%S+") do
+    for word in text:gmatch("[^ \t\r\n]+") do
         words[#words + 1] = word
     end
     return words
@@ -19569,229 +20208,6 @@ function M.draw()
     end
 end
 return M
-end)()
-
-April._mods["features.visuals.target_visuals"] = (function()
-local settings = April.require("core.settings")
-local draw_util = April.require("core.draw_util")
-local menu_util = April.require("core.menu_util")
-local active_target = April.require("features.combat.active_target")
-local overlay_theme = April.require("core.overlay_theme")
-local M = {}
-local P = "april_crosshair_enabled"
-local CROSS_STYLES = { "Cross", "Circle", "Dot", "T-Shape", "Diamond", "Plus", "Brackets", "X" }
-local follow = { x = nil, y = nil, ready = false }
-local function tick_s()
-    return (utility and utility.get_tick_count and utility.get_tick_count() or 0) * 0.001
-end
-local function screen_center()
-    local sw, sh = draw_util.screen_size()
-    return sw * 0.5, sh * 0.5
-end
-local function lerp(a, b, t)
-    return a + (b - a) * t
-end
-local function follow_alpha(dt)
-    dt = dt or (1 / 60)
-    local rate = settings.num("april_crosshair_follow_smooth", 18) * 0.045
-    return 1 - math.exp(-rate * dt * 60)
-end
-local function crosshair_color()
-    if settings.bool("april_crosshair_rainbow", false) then
-        local t = tick_s()
-        local speed = settings.num("april_crosshair_rainbow_speed", 10) * 0.1
-        return {
-            (math.sin(t * speed) + 1) * 0.5,
-            (math.sin(t * speed + 2) + 1) * 0.5,
-            (math.sin(t * speed + 4) + 1) * 0.5,
-            1,
-        }
-    end
-    return settings.color("april_crosshair_color", { 0, 1, 0, 1 })
-end
-local function motion_scale(base_size)
-    if not settings.bool("april_crosshair_pulse", false) then
-        return base_size
-    end
-    local speed = settings.num("april_crosshair_pulse_speed", 40) * 0.05
-    local wave = 0.82 + 0.18 * math.sin(tick_s() * speed * 3.2)
-    return base_size * wave
-end
-local function spin_angle()
-    if not settings.bool("april_crosshair_spin", false) then
-        return 0
-    end
-    local speed = settings.num("april_crosshair_spin_speed", 35) * 0.04
-    return tick_s() * speed * 6.283
-end
-local function rot_point(cx, cy, x, y, angle)
-    local dx, dy = x - cx, y - cy
-    local c, s = math.cos(angle), math.sin(angle)
-    return cx + dx * c - dy * s, cy + dx * s + dy * c
-end
-local function draw_line(x1, y1, x2, y2, col, thick, outline)
-    if outline and settings.bool("april_crosshair_outline", true) then
-        local oc = settings.color("april_crosshair_outline", { 0, 0, 0, 1 })
-        local oa = { oc[1], oc[2], oc[3], (col[4] or 1) * (oc[4] or 1) }
-        draw_util.line(x1, y1, x2, y2, oa, (thick or 1) + 1.5)
-    end
-    draw_util.line(x1, y1, x2, y2, col, thick or 1)
-end
-local function draw_spoke(cx, cy, angle, inner, outer, col, thick, outline)
-    local x1, y1 = rot_point(cx, cy, cx, cy - inner, angle)
-    local x2, y2 = rot_point(cx, cy, cx, cy - outer, angle)
-    draw_line(x1, y1, x2, y2, col, thick, outline)
-end
-local function draw_cross(cx, cy, size, gap, thick, col, outline, spin)
-    spin = spin or 0
-    for i = 0, 3 do
-        local a = spin + i * 1.5707963
-        draw_spoke(cx, cy, a, gap, gap + size, col, thick, outline)
-    end
-end
-local function draw_plus(cx, cy, size, thick, col, outline, spin)
-    spin = spin or 0
-    for i = 0, 3 do
-        local a = spin + i * 1.5707963
-        draw_spoke(cx, cy, a, 0, size, col, thick, outline)
-    end
-end
-local function draw_x(cx, cy, size, thick, col, outline, spin)
-    spin = spin or 0
-    for _, base in ipairs({ 0.785398, 2.35619 }) do
-        draw_spoke(cx, cy, spin + base, 0, size, col, thick, outline)
-    end
-end
-local function draw_brackets(cx, cy, size, thick, col, outline)
-    local w = size * 0.55
-    local h = size
-    draw_line(cx - w, cy - h, cx - w * 0.35, cy - h, col, thick, outline)
-    draw_line(cx - w, cy - h, cx - w, cy - h * 0.35, col, thick, outline)
-    draw_line(cx - w, cy + h, cx - w * 0.35, cy + h, col, thick, outline)
-    draw_line(cx - w, cy + h, cx - w, cy + h * 0.35, col, thick, outline)
-    draw_line(cx + w, cy - h, cx + w * 0.35, cy - h, col, thick, outline)
-    draw_line(cx + w, cy - h, cx + w, cy - h * 0.35, col, thick, outline)
-    draw_line(cx + w, cy + h, cx + w * 0.35, cy + h, col, thick, outline)
-    draw_line(cx + w, cy + h, cx + w, cy + h * 0.35, col, thick, outline)
-end
-local function draw_diamond(cx, cy, size, col)
-    if draw and draw.line then
-        draw.line(cx, cy - size, cx + size, cy, col, 2)
-        draw.line(cx + size, cy, cx, cy + size, col, 2)
-        draw.line(cx, cy + size, cx - size, cy, col, 2)
-        draw.line(cx - size, cy, cx, cy - size, col, 2)
-    else
-        draw_util.line(cx, cy - size, cx + size, cy, col, 2)
-        draw_util.line(cx + size, cy, cx, cy + size, col, 2)
-        draw_util.line(cx, cy + size, cx - size, cy, col, 2)
-        draw_util.line(cx - size, cy, cx, cy - size, col, 2)
-    end
-end
-local function draw_crosshair(cx, cy)
-    local size = motion_scale(settings.num("april_crosshair_size", 10))
-    local gap = settings.num("april_crosshair_gap", 5)
-    local thick = settings.num("april_crosshair_thickness", 2)
-    local col = crosshair_color()
-    local outline = settings.bool("april_crosshair_outline", true)
-    local kind = math.floor(settings.num("april_crosshair_type", 0) or 0)
-    local spin = spin_angle()
-    if kind == 1 then
-        draw_util.circle(cx, cy, size, col, false)
-    elseif kind == 2 then
-        draw_util.circle(cx, cy, size * 0.5, col, true)
-    elseif kind == 3 then
-        draw_line(cx - size, cy - size * 0.45, cx + size, cy - size * 0.45, col, thick, outline)
-        draw_line(cx, cy - size * 0.45, cx, cy + size, col, thick, outline)
-    elseif kind == 4 then
-        draw_diamond(cx, cy, size * 0.75, col)
-    elseif kind == 5 then
-        draw_plus(cx, cy, size, thick, col, outline, spin)
-    elseif kind == 6 then
-        draw_brackets(cx, cy, size, thick, col, outline)
-    elseif kind == 7 then
-        draw_x(cx, cy, size, thick, col, outline, spin)
-    else
-        draw_cross(cx, cy, size, gap, thick, col, outline, spin)
-    end
-    if settings.bool("april_crosshair_dot", false) then
-        local dc = settings.color("april_crosshair_dot", { 1, 1, 1, 1 })
-        draw_util.circle(cx, cy, math.max(1.5, thick), dc, true)
-    end
-end
-function M.register_menu()
-    local G = menu_util.G
-    local T, _ = menu_util.group(G.VISUALS)
-    local root = menu_util.parent(P)
-    menu_util.section(T, G.VISUALS, "Crosshair")
-    menu.add_checkbox(T, G.VISUALS, P, "Custom Crosshair", false)
-    menu.add_combo(T, G.VISUALS, "april_crosshair_type", "Crosshair Style", CROSS_STYLES, 0, root)
-    menu.add_checkbox(T, G.VISUALS, "april_crosshair_follow", "Follow Target", false, root)
-    menu.add_combo(T, G.VISUALS, active_target.SOURCE_CROSSHAIR, "Target From",
-        active_target.SOURCE_NAMES, 0, menu_util.parent("april_crosshair_follow"))
-    menu.add_slider_int(T, G.VISUALS, "april_crosshair_follow_smooth", "Follow Smoothness", 4, 40, 18,
-        menu_util.parent("april_crosshair_follow"))
-    menu.add_checkbox(T, G.VISUALS, "april_crosshair_spin", "Spin", false, root)
-    menu.add_slider_int(T, G.VISUALS, "april_crosshair_spin_speed", "Spin Speed", 1, 100, 35,
-        menu_util.parent("april_crosshair_spin"))
-    menu.add_checkbox(T, G.VISUALS, "april_crosshair_pulse", "Pulse Size", false, root)
-    menu.add_slider_int(T, G.VISUALS, "april_crosshair_pulse_speed", "Pulse Speed", 1, 100, 40,
-        menu_util.parent("april_crosshair_pulse"))
-    menu.add_checkbox(T, G.VISUALS, "april_crosshair_color", "Crosshair Color", true,
-        menu_util.parent(P, { colorpicker = { 0, 1, 0, 1 } }))
-    menu.add_checkbox(T, G.VISUALS, "april_crosshair_dot", "Center Dot", false,
-        menu_util.parent(P, { colorpicker = { 1, 1, 1, 1 } }))
-    menu.add_checkbox(T, G.VISUALS, "april_crosshair_outline", "Outline", true,
-        menu_util.parent(P, { colorpicker = { 0, 0, 0, 1 } }))
-    menu.add_checkbox(T, G.VISUALS, "april_crosshair_rainbow", "Rainbow", false, root)
-    menu.add_slider_int(T, G.VISUALS, "april_crosshair_rainbow_speed", "Rainbow Speed", 1, 100, 10,
-        menu_util.parent("april_crosshair_rainbow"))
-    menu.add_slider_int(T, G.VISUALS, "april_crosshair_size", "Size", 1, 50, 10, root)
-    menu.add_slider_int(T, G.VISUALS, "april_crosshair_gap", "Gap", 0, 20, 5, root)
-    menu.add_slider_int(T, G.VISUALS, "april_crosshair_thickness", "Thickness", 1, 10, 2, root)
-    menu_util.bind_children(P, {
-        "april_crosshair_type", "april_crosshair_follow", "april_crosshair_spin", "april_crosshair_pulse",
-        "april_crosshair_color", "april_crosshair_dot", "april_crosshair_outline",
-        "april_crosshair_rainbow", "april_crosshair_rainbow_speed",
-        "april_crosshair_size", "april_crosshair_gap", "april_crosshair_thickness",
-    })
-    menu_util.bind_children("april_crosshair_follow", {
-        active_target.SOURCE_CROSSHAIR, "april_crosshair_follow_smooth",
-    })
-    menu_util.bind_children("april_crosshair_spin", { "april_crosshair_spin_speed" })
-    menu_util.bind_children("april_crosshair_pulse", { "april_crosshair_pulse_speed" })
-    menu_util.bind_children("april_crosshair_rainbow", { "april_crosshair_rainbow_speed" })
-end
-function M.update(dt)
-    local cx, cy = screen_center()
-    if not follow.ready then
-        follow.x, follow.y = cx, cy
-        follow.ready = true
-    end
-    local goal_x, goal_y = cx, cy
-    if settings.bool("april_crosshair_follow", false) then
-        local pt = active_target.get_aim_screen(nil, follow.x, follow.y, active_target.SOURCE_CROSSHAIR)
-        if pt then
-            goal_x, goal_y = pt.x, pt.y
-        end
-    end
-    local alpha = follow_alpha(dt)
-    follow.x = lerp(follow.x, goal_x, alpha)
-    follow.y = lerp(follow.y, goal_y, alpha)
-end
-function M.draw()
-    local cx, cy = screen_center()
-    if settings.bool("april_crosshair_follow", false) and follow.ready then
-        cx, cy = follow.x, follow.y
-    end
-    if settings.enabled(P) then
-        draw_crosshair(cx, cy)
-    end
-end
-return M
-end)()
-
-April._mods["features.visuals.crosshair"] = (function()
-return April.require("features.visuals.target_visuals")
 end)()
 
 April._mods["features.world.world_esp"] = (function()
@@ -21761,1237 +22177,6 @@ end
 return M
 end)()
 
-April._mods["features.movement.fling"] = (function()
-local settings = April.require("core.settings")
-local env = April.require("core.env")
-local menu_util = April.require("core.menu_util")
-local move = April.require("core.cframe_move")
-local math_util = April.require("core.math_util")
-local esp_util = April.require("core.esp_util")
-local player_state = April.require("game.player_state")
-local misc_gate = April.require("core.misc_gate")
-local M = {}
-local P = "april_fling_enabled"
-local P_FOV = "april_fling_fov"
-local P_DURATION = "april_fling_duration"
-local MAX_DIST = 300.0
-local FAR_RANGE = 40.0
-local SPIN_Y_START = 48000.0
-local SPIN_Y_MAX = 70000.0
-local SPIN_RAMP_SEC = 0.35
-local BASE_PREDICT = 0.05
-local MAX_SNAP_PASSES = 10
-local FLING_HIT_PARTS = { "HumanoidRootPart" }
-local function fling_duration()
-return settings.num(P_DURATION, 2)
-end
-local STATE_IDLE = 0
-local STATE_APPROACH = 1
-local STATE_FLING = 2
-local STATE_RETURN = 3
-local RETURN_TICKS = 15
-local MAX_ATTACH_DRIFT = 6.0
-local _installed = false
-local state = STATE_IDLE
-local fling_t0 = 0
-local approach_left = 0
-local return_left = 0
-local start_range = 0
-local saved_pos = nil
-local target_root = nil
-local target_player = nil
-local last_attach = nil
-local function now()
-if utility and utility.get_time then return utility.get_time() end
-return os.clock()
-end
-local function screen_center()
-if input and input.get_screen_center then
-local cx, cy = input.get_screen_center()
-if cx and cy then return cx, cy end
-end
-if draw and draw.get_screen_size then
-local w, h = draw.get_screen_size()
-return w * 0.5, h * 0.5
-end
-return 960, 540
-end
-local function get_character(lp)
-if lp and lp.character then return lp.character end
-if game and game.local_player and game.local_player.character then
-return game.local_player.character
-end
-return nil
-end
-local function get_root(lp)
-local char = get_character(lp)
-if not char then return nil end
-return env.safe_call(function()
-if char.find_first_child then return char:find_first_child("HumanoidRootPart") end
-return char:FindFirstChild("HumanoidRootPart")
-end)
-end
-local function get_humanoid(lp)
-if lp and lp.humanoid and env.is_valid(lp.humanoid) then
-return lp.humanoid
-end
-local char = get_character(lp)
-if not char then return nil end
-return env.safe_call(function()
-if char.find_first_child_of_class then return char:find_first_child_of_class("Humanoid") end
-return char:FindFirstChildOfClass("Humanoid")
-end)
-end
-local function player_root(p)
-if not p or not p.character then return nil end
-local char = p.character
-return env.safe_call(function()
-if char.find_first_child then return char:find_first_child("HumanoidRootPart") end
-return char:FindFirstChild("HumanoidRootPart")
-end)
-end
-local function refresh_target_root()
-if not target_player then return false end
-local root = player_root(target_player)
-if root and env.is_valid(root) then
-target_root = root
-return true
-end
-return target_root ~= nil and env.is_valid(target_root)
-end
-local function target_still_valid()
-if not target_player then return false end
-if target_player.character and env.is_valid(target_player.character) then
-return true
-end
-if target_player.position then
-return true
-end
-return refresh_target_root()
-end
-local function player_aim_pos(p)
-if p.position then
-return p.position.x, p.position.y, p.position.z
-end
-if p.head_position then
-local h = p.head_position
-return h.x, h.y, h.z
-end
-local root = player_root(p)
-if root then
-local pos = move.read_pos(root)
-if pos then
-return pos.x, pos.y, pos.z
-end
-end
-return nil
-end
-local function world_dist_to_player(p, from)
-if not p or not from then return math.huge end
-if p.distance_to then
-return p:distance_to(from)
-end
-local ax, ay, az = player_aim_pos(p)
-if not ax or not from.x then return math.huge end
-return math_util.distance3(ax - from.x, ay - from.y, az - from.z)
-end
-local function find_target(fov_px)
-local cx, cy = screen_center()
-local cam = camera and camera.get_position and camera.get_position()
-local best, best_dist = nil, fov_px
-for _, p in ipairs(April.require("core.cache").players) do
-if not player_state.is_combat_target(p) then goto continue end
-if cam and world_dist_to_player(p, cam) > MAX_DIST then goto continue end
-local ax, ay, az = player_aim_pos(p)
-if not ax then goto continue end
-local sx, sy, on_screen = esp_util.w2s(ax, ay, az)
-if not on_screen then goto continue end
-local fov_dist = math_util.screen_fov_dist(sx, sy, cx, cy)
-if fov_dist > fov_px or fov_dist >= best_dist then goto continue end
-local root = player_root(p)
-if not root or not env.is_valid(root) then goto continue end
-best_dist = fov_dist
-best = p
-::continue::
-end
-if not best then return nil, nil end
-return best, player_root(best)
-end
-local function read_part_velocity(inst)
-if not inst then return 0, 0, 0 end
-local vel = inst.Velocity or inst.velocity
-if vel then
-return vel.x or vel.X or 0, vel.y or vel.Y or 0, vel.z or vel.Z or 0
-end
-local assembly = inst.AssemblyLinearVelocity
-if assembly then
-return assembly.x or assembly.X or 0, assembly.y or assembly.Y or 0, assembly.z or assembly.Z or 0
-end
-return 0, 0, 0
-end
-local function read_target_velocity(tgt_root, far_lock)
-local ex, ey, ez = 0, 0, 0
-local px, py, pz = 0, 0, 0
-local has_entity = false
-local has_part = false
-if target_player and target_player.velocity then
-local v = target_player.velocity
-ex, ey, ez = v.x or 0, v.y or 0, v.z or 0
-has_entity = true
-end
-if tgt_root and env.is_valid(tgt_root) then
-px, py, pz = read_part_velocity(tgt_root)
-has_part = true
-end
-if far_lock and has_entity then
-return ex, ey, ez
-end
-if has_entity and has_part then
-local entity_speed = math_util.distance3(ex, ey, ez)
-local part_speed = math_util.distance3(px, py, pz)
-if part_speed > entity_speed then
-return px, py, pz
-end
-return ex, ey, ez
-end
-if has_entity then return ex, ey, ez end
-if has_part then return px, py, pz end
-return 0, 0, 0
-end
-local function read_attach_pos_raw(tgt_root)
-local entity_x, entity_y, entity_z
-local has_entity = false
-if target_player and target_player.position then
-local p = target_player.position
-entity_x, entity_y, entity_z = p.x, p.y, p.z
-has_entity = true
-end
-local part_x, part_y, part_z
-local has_part = false
-if tgt_root and env.is_valid(tgt_root) then
-local tpos = move.read_pos(tgt_root)
-if tpos then
-part_x, part_y, part_z = tpos.x, tpos.y, tpos.z
-has_part = true
-end
-end
-if has_entity and has_part then
-local spread = math_util.distance3(part_x - entity_x, part_y - entity_y, part_z - entity_z)
-if spread > FAR_RANGE or start_range > FAR_RANGE or spread > 8 then
-return entity_x, entity_y, entity_z
-end
-return part_x, part_y, part_z
-end
-if has_entity then return entity_x, entity_y, entity_z end
-if has_part then return part_x, part_y, part_z end
-if last_attach then
-return last_attach.x, last_attach.y, last_attach.z
-end
-return nil
-end
-local function read_attach_pos(tgt_root, lpos)
-local tx, ty, tz = read_attach_pos_raw(tgt_root)
-if not tx then return nil end
-local far_lock = start_range > FAR_RANGE
-if lpos then
-local live_range = math_util.distance3(tx - lpos.x, ty - lpos.y, tz - lpos.z)
-if live_range > FAR_RANGE then
-far_lock = true
-end
-end
-local vx, vy, vz = read_target_velocity(tgt_root, far_lock)
-local horiz_speed = math_util.distance3(vx, 0, vz)
-local predict = BASE_PREDICT + horiz_speed * 0.003
-if far_lock then
-predict = predict + 0.02
-end
-tx = tx + vx * predict
-ty = ty + vy * predict * 0.12
-tz = tz + vz * predict
-last_attach = { x = tx, y = ty, z = tz }
-return tx, ty, tz
-end
-local function snap_passes(range, drift)
-local base = 4
-if range > 220 then base = 10
-elseif range > 150 then base = 8
-elseif range > 100 then base = 7
-elseif range > 60 then base = 6
-elseif range > 30 then base = 5
-end
-if drift > 12 then base = base + 3
-elseif drift > 6 then base = base + 2
-elseif drift > 2 then base = base + 1
-end
-return math.min(MAX_SNAP_PASSES, base)
-end
-local function approach_ticks_for(dist)
-if dist <= FAR_RANGE then return 0 end
-return math.min(12, math.floor(dist / 22) + 3)
-end
-local function set_fling_collision(char, active)
-if not char then return end
-for _, inst in ipairs(move.iter_parts(char)) do
-move.set_part_collide(inst, false)
-end
-if not active then
-move.set_character_noclip(char, nil, false)
-return
-end
-for i = 1, #FLING_HIT_PARTS do
-local hit = move.find_part(char, FLING_HIT_PARTS[i])
-if hit and move.is_base_part(hit) then
-move.set_part_collide(hit, true)
-end
-end
-end
-local function prep_fling(char, root, hum)
-set_fling_collision(char, true)
-move.humanoid_suspend(hum)
-pcall(function() hum.platform_stand = true end)
-pcall(function() hum.sit = false end)
-move.humanoid_state(hum, 13)
-end
-local function release_fling(char, root, hum)
-if root then
-move.zero_part(root)
-end
-move.zero_character(char, root)
-set_fling_collision(char, false)
-if hum then
-pcall(function() hum.platform_stand = false end)
-pcall(function() hum.sit = false end)
-pcall(function() hum.auto_rotate = true end)
-pcall(function() hum.evaluate_state_machine = true end)
-move.humanoid_running(hum)
-end
-end
-local function write_pos(inst, x, y, z)
-if not inst then return end
-if part and part.set_position then
-pcall(part.set_position, inst, x, y, z)
-else
-pcall(function() inst.Position = Vector3.new(x, y, z) end)
-end
-end
-local function zero_linear(char, root)
-if root then
-move.set_velocity(root, 0, 0, 0)
-end
-for _, inst in ipairs(move.iter_parts(char)) do
-move.set_velocity(inst, 0, 0, 0)
-end
-end
-local function lock_at(root, char, x, y, z, passes)
-passes = passes or 3
-for _ = 1, passes do
-write_pos(root, x, y, z)
-end
-zero_linear(char, root)
-end
-local function clear_session()
-state = STATE_IDLE
-fling_t0 = 0
-approach_left = 0
-return_left = 0
-start_range = 0
-saved_pos = nil
-target_root = nil
-target_player = nil
-last_attach = nil
-end
-local function pin_to_target(root, tgt_root, from_pos)
-local lpos = move.read_pos(root)
-local tx, ty, tz = read_attach_pos(tgt_root, lpos)
-if not tx then return false end
-local drift = 0
-local range = start_range
-if lpos then
-drift = math_util.distance3(tx - lpos.x, ty - lpos.y, tz - lpos.z)
-range = math.max(range, drift)
-elseif from_pos then
-drift = math_util.distance3(tx - from_pos.x, ty - from_pos.y, tz - from_pos.z)
-range = math.max(range, drift)
-end
-local passes = snap_passes(range, drift)
-for _ = 1, passes do
-write_pos(root, tx, ty, tz)
-end
-zero_linear(nil, root)
-return true, tx, ty, tz
-end
-local function spin_strength(elapsed)
-local t = math.min(1, elapsed / SPIN_RAMP_SEC)
-return SPIN_Y_START + (SPIN_Y_MAX - SPIN_Y_START) * t
-end
-local function apply_spin(root, elapsed)
-if not root then return end
-move.set_velocity(root, 0, 0, 0)
-if part and part.set_angular_velocity then
-pcall(part.set_angular_velocity, root, 0, spin_strength(elapsed), 0)
-end
-end
-local function begin_return(root, char, hum)
-state = STATE_RETURN
-return_left = RETURN_TICKS
-target_root = nil
-target_player = nil
-last_attach = nil
-set_fling_collision(char, false)
-if root and part and part.set_angular_velocity then
-pcall(part.set_angular_velocity, root, 0, 0, 0)
-end
-move.zero_character(char, root)
-if hum then
-pcall(function() hum.platform_stand = true end)
-move.humanoid_suspend(hum)
-end
-end
-local function finish_fling(root, char, hum)
-if saved_pos and root then
-lock_at(root, char, saved_pos.x, saved_pos.y, saved_pos.z, 6)
-move.zero_part(root)
-end
-release_fling(char, root, hum)
-clear_session()
-end
-local function stop_fling(root, char, hum)
-begin_return(root, char, hum)
-end
-local function tick_return(root, char, hum)
-if not saved_pos or not root then
-finish_fling(root, char, hum)
-return
-end
-lock_at(root, char, saved_pos.x, saved_pos.y, saved_pos.z, 4)
-move.zero_character(char, root)
-local pos = move.read_pos(root)
-local settled = pos and math_util.distance3(
-pos.x - saved_pos.x, pos.y - saved_pos.y, pos.z - saved_pos.z
-) < 1.5
-return_left = return_left - 1
-if settled or return_left <= 0 then
-finish_fling(root, char, hum)
-end
-end
-local function begin_fling(root, char, hum, tgt_player, tgt_root)
-local pos = move.read_pos(root)
-if not pos then return false end
-target_player = tgt_player
-target_root = tgt_root
-last_attach = nil
-local raw_x, raw_y, raw_z = read_attach_pos_raw(tgt_root)
-if not raw_x then return false end
-start_range = math_util.distance3(raw_x - pos.x, raw_y - pos.y, raw_z - pos.z)
-local tx, ty, tz = read_attach_pos(tgt_root, pos)
-if not tx then return false end
-saved_pos = { x = pos.x, y = pos.y, z = pos.z }
-fling_t0 = now()
-approach_left = approach_ticks_for(start_range)
-if approach_left > 0 then
-state = STATE_APPROACH
-else
-state = STATE_FLING
-end
-prep_fling(char, root, hum)
-pin_to_target(root, tgt_root, pos)
-if state == STATE_FLING then
-apply_spin(root, 0)
-end
-return true
-end
-local function tick_approach(root, char, hum)
-prep_fling(char, root, hum)
-if not pin_to_target(root, target_root, nil) then
-stop_fling(root, char, hum)
-return
-end
-approach_left = approach_left - 1
-if approach_left <= 0 then
-state = STATE_FLING
-apply_spin(root, now() - fling_t0)
-end
-end
-local function tick_fling(root, char, hum)
-local elapsed = now() - fling_t0
-if elapsed >= fling_duration() then
-stop_fling(root, char, hum)
-return
-end
-if not target_still_valid() then
-stop_fling(root, char, hum)
-return
-end
-refresh_target_root()
-prep_fling(char, root, hum)
-local ok, tx, ty, tz = pin_to_target(root, target_root, nil)
-if not ok then
-stop_fling(root, char, hum)
-return
-end
-apply_spin(root, elapsed)
-lock_at(root, char, tx, ty, tz, 3)
-local pos = move.read_pos(root)
-if pos and math_util.distance3(pos.x - tx, pos.y - ty, pos.z - tz) > MAX_ATTACH_DRIFT then
-lock_at(root, char, tx, ty, tz, 5)
-end
-end
-local function tick_active(root, char, hum)
-if state == STATE_APPROACH then
-tick_approach(root, char, hum)
-return
-end
-if state == STATE_RETURN then
-tick_return(root, char, hum)
-return
-end
-tick_fling(root, char, hum)
-end
-local function try_trigger()
-if state ~= STATE_IDLE then return end
-if not settings.enabled(P) then return end
-local lp = env.get_local_player()
-if not lp then return end
-local char = get_character(lp)
-local root = get_root(lp)
-local hum = get_humanoid(lp)
-if not char or not root or not hum then return end
-local fov = settings.num(P_FOV, 150)
-local tgt_player, tgt_root = find_target(fov)
-if not tgt_root then return end
-begin_fling(root, char, hum, tgt_player, tgt_root)
-end
-local was_enabled = false
-local function poll_enable()
-local on = settings.enabled(P)
-if on and not was_enabled then
-try_trigger()
-end
-was_enabled = on
-end
-local function tick(_dt)
-if state == STATE_IDLE then
-if not misc_gate.movement_allowed() then
-was_enabled = settings.enabled(P)
-return
-end
-poll_enable()
-return
-end
-if state ~= STATE_RETURN and not misc_gate.movement_allowed() then
-return
-end
-local lp = env.get_local_player()
-if not lp then
-if state == STATE_RETURN and saved_pos then
-return_left = RETURN_TICKS
-else
-clear_session()
-end
-return
-end
-local char = get_character(lp)
-local root = get_root(lp)
-local hum = get_humanoid(lp)
-if not char or not root or not hum then
-stop_fling(root, char, hum)
-return
-end
-tick_active(root, char, hum)
-end
-function M.is_active()
-return state == STATE_APPROACH or state == STATE_FLING or state == STATE_RETURN
-end
-function M.register_menu()
-local G = menu_util.G
-local T = menu_util.group(G.MISC)
-local root = menu_util.parent(P)
-menu_util.section(T, G.MISC, "Combat")
-menu_util.register_keybind(T, G.MISC, P, "Fling", false)
-menu.add_slider_int(T, G.MISC, P_FOV, "Fling FOV", 5, 600, 150, root)
-menu.add_slider_int(T, G.MISC, P_DURATION, "Fling Duration", 2, 10, 2, root)
-menu_util.bind_children(P, { P_FOV, P_DURATION })
-end
-function M.install()
-if _installed then return end
-_installed = true
-local runservice = April.require("core.runservice")
-runservice.on_sim(function(dt)
-tick(dt)
-end)
-end
-function M.update(_dt) end
-function M.draw() end
-return M
-end)()
-
-April._mods["features.movement.desync"] = (function()
-local settings = April.require("core.settings")
-local env = April.require("core.env")
-local menu_util = April.require("core.menu_util")
-local fflag_mem = April.require("core.fflag_mem")
-local desync_vis = April.require("core.desync_vis")
-local esp_util = April.require("core.esp_util")
-local draw_util = April.require("core.draw_util")
-local misc_gate = April.require("core.misc_gate")
-local M = {}
-local P = "april_desync_enabled"
-local P_VIS = "april_desync_visualizer"
-local RANGE_RADIUS = 8
-local LOOP_MS = 30
-local last_tick = 0
-local last_flag_apply = 0
-local old_phys, old_send = nil, nil
-local was_active = false
-local anchor_pos = nil
-local peek_hold = false
-local function now()
-if utility and utility.get_time then return utility.get_time() end
-return os.clock()
-end
-local function get_root()
-local lp = env.get_local_player()
-if not lp then return nil end
-local char = lp.character or (game and game.local_player and game.local_player.character)
-if not char then return nil end
-return env.safe_call(function()
-if char.find_first_child then return char:find_first_child("HumanoidRootPart") end
-return char:FindFirstChild("HumanoidRootPart")
-end)
-end
-local function capture_pos(root)
-if not root then return nil end
-local pos = root.Position or root.position
-if not pos then return nil end
-return {
-x = pos.X or pos.x or 0,
-y = pos.Y or pos.y or 0,
-z = pos.Z or pos.z or 0,
-}
-end
-local function dist_from_anchor(pos)
-if not anchor_pos or not pos then return 0 end
-local dx = pos.x - anchor_pos.x
-local dy = pos.y - anchor_pos.y
-local dz = pos.z - anchor_pos.z
-return math.sqrt(dx * dx + dy * dy + dz * dz)
-end
-local function apply_rates(physics_rate, sender_rate)
-local phys = tonumber(physics_rate) or 0
-local send = tonumber(sender_rate) or 60
-local bw = phys == 0 and 0 or 38760
-fflag_mem.set_int("S2PhysicsSenderRate", phys)
-fflag_mem.set_int("PhysicsSenderMaxBandwidthBps", bw)
-fflag_mem.set_int("DataSenderRate", send)
-end
-local function restore_rates()
-fflag_mem.reset_defaults()
-old_phys, old_send = nil, nil
-last_flag_apply = 0
-end
-local function active()
-return settings.enabled(P)
-end
-function M.peek_begin()
-if peek_hold then return end
-peek_hold = true
-pcall(fflag_mem.refresh)
-if not active() then
-apply_rates(0, 60)
-old_phys, old_send = 0, 60
-last_flag_apply = now()
-end
-end
-function M.peek_end()
-if not peek_hold then return end
-peek_hold = false
-if not active() then
-restore_rates()
-anchor_pos = nil
-was_active = false
-end
-end
-function M.peek_held()
-return peek_hold
-end
-local function disable_desync()
-if menu and menu.set then
-pcall(menu.set, P, false)
-end
-end
-local function compute_rates(_t)
-return 0, 60
-end
-local function draw_center_dot(wx, wy, wz, col)
-local sx, sy, vis = esp_util.w2s(wx, wy, wz)
-if vis then
-draw_util.circle(sx, sy, 5, col, true)
-draw_util.circle(sx, sy, 5, { 0, 0, 0, col[4] or 1 }, false)
-end
-end
-local function draw_visualizer()
-if not anchor_pos then return end
-local col = settings.color(P_VIS, { 0.2, 0.85, 1, 0.9 })
-local ring_col = { col[1], col[2], col[3], 0.55 }
-desync_vis.draw_sphere_ring(anchor_pos.x, anchor_pos.y, anchor_pos.z, RANGE_RADIUS, ring_col, 2)
-if settings.bool(P_VIS, false) then
-draw_center_dot(anchor_pos.x, anchor_pos.y, anchor_pos.z, col)
-end
-end
-function M.register_menu()
-local G = menu_util.G
-local T, _ = menu_util.group(G.MISC)
-local root = menu_util.parent(P)
-menu_util.section(T, G.MISC, "Network")
-menu_util.register_keybind(T, G.MISC, P, "Desync", false)
-menu.add_checkbox(T, G.MISC, P_VIS, "Desync Visualize", false, menu_util.parent(P, {
-colorpicker = { 0.2, 0.85, 1, 0.9 },
-}))
-menu_util.bind_children(P, { P_VIS })
-end
-function M.update(_dt)
-if not misc_gate.movement_allowed() then return end
-local user_on = active()
-local held = peek_hold
-local on = user_on or held
-local t = now()
-if was_active and not on then
-restore_rates()
-anchor_pos = nil
-end
-if user_on and not was_active then
-pcall(fflag_mem.refresh)
-local root = get_root()
-anchor_pos = capture_pos(root)
-end
-was_active = on
-if not on then return end
-if (t - last_tick) * 1000 < LOOP_MS then return end
-last_tick = t
-local phys, send = compute_rates(t)
-local root = get_root()
-if user_on and root and anchor_pos then
-local pos = capture_pos(root)
-if pos and dist_from_anchor(pos) > RANGE_RADIUS then
-restore_rates()
-anchor_pos = nil
-was_active = false
-disable_desync()
-return
-end
-end
-if phys ~= old_phys or send ~= old_send or (t - last_flag_apply) > 0.35 then
-apply_rates(phys, send)
-old_phys, old_send = phys, send
-last_flag_apply = t
-end
-end
-function M.draw()
-if not misc_gate.movement_allowed() then return end
-if not active() and not peek_hold then return end
-draw_visualizer()
-end
-return M
-end)()
-
-April._mods["features.movement.anti_aim"] = (function()
-local settings = April.require("core.settings")
-local env = April.require("core.env")
-local menu_util = April.require("core.menu_util")
-local move = April.require("core.cframe_move")
-local misc_gate = April.require("core.misc_gate")
-local angle_util = April.require("core.angle_util")
-local M = {}
-local P = "april_antiaim_enabled"
-local P_YAW = "april_antiaim_yaw_mode"
-local P_YAW_MANUAL = "april_antiaim_yaw_manual"
-local P_SPIN = "april_antiaim_spin_speed"
-local P_JITTER = "april_antiaim_jitter_step"
-local P_JITTER_MS = "april_antiaim_jitter_ms"
-local YAW_LABELS = {
-"None", "Backwards", "Spin", "Jitter", "Random Jitter",
-"Sideways Left", "Sideways Right", "Manual",
-}
-local YAW_MANUAL_IDX = 7
-local YAW_SPIN, YAW_JITTER, YAW_RAND = 2, 3, 4
-local YAW_GAIN = 22
-local YAW_AV_MAX = 40
-local YAW_SNAP_EPS = 0.02
-local SHOOT_VK = 0x01
-local state = {
-fake_yaw = 0,
-yaw_jitter_idx = 0,
-jitter_t = 0,
-random_yaw = 0,
-spin_yaw = 0,
-was_active = false,
-was_firing = false,
-}
-M.YAW_LABELS = YAW_LABELS
-local function active()
-return settings.enabled(P)
-end
-local function find_child(parent, name)
-if not parent then return nil end
-return env.safe_call(function()
-if parent.FindFirstChild then return parent:FindFirstChild(name) end
-if parent.find_first_child then return parent:find_first_child(name) end
-return nil
-end)
-end
-local function get_character(lp)
-if not lp then lp = env.get_local_player() end
-if lp then
-local char = lp.Character or lp.character
-if char then return char end
-end
-local rp = game and (game.LocalPlayer or game.local_player)
-if rp then return rp.Character or rp.character end
-return nil
-end
-local function get_humanoid(lp)
-if lp then
-local hum = lp.Humanoid or lp.humanoid
-if hum then return hum end
-end
-local char = get_character(lp)
-return char and (move.find_part(char, "Humanoid") or find_child(char, "Humanoid"))
-end
-local function get_root(lp)
-local char = get_character(lp)
-if not char then return nil end
-return move.find_part(char, "HumanoidRootPart")
-or find_child(char, "HumanoidRootPart")
-or env.safe_call(function() return char.PrimaryPart or char.primary_part end)
-end
-local function get_attr(inst, name)
-if not inst then return nil end
-return env.safe_call(function()
-if inst.GetAttribute then return inst:GetAttribute(name) end
-if inst.get_attribute then return inst:get_attribute(name) end
-return nil
-end)
-end
-local function is_firing(char)
-if input and input.is_key_down and input.is_key_down(SHOOT_VK) then
-return true
-end
-local vm = char and find_child(char, "ViewmodelController")
-if vm then
-if get_attr(vm, "Using") == true then return true end
-end
-return false
-end
-local function compute_fake_yaw(real_yaw, dt)
-local mode = settings.combo_index(P_YAW, YAW_LABELS, 0)
-if mode == 0 then return nil end
-dt = dt or 0.016
-if mode == 1 then return angle_util.normalize_yaw(real_yaw + math.pi) end
-if mode == 2 then
-state.spin_yaw = angle_util.normalize_yaw(state.spin_yaw + math.rad(settings.num(P_SPIN, 180)) * dt)
-return angle_util.normalize_yaw(real_yaw + state.spin_yaw)
-end
-if mode == 3 then
-local step = math.max(15, settings.num(P_JITTER, 90))
-return angle_util.normalize_yaw(real_yaw + math.rad(state.yaw_jitter_idx * step))
-end
-if mode == 4 then return angle_util.normalize_yaw(real_yaw + state.random_yaw) end
-if mode == 5 then return angle_util.normalize_yaw(real_yaw + math.pi * 0.5) end
-if mode == 6 then return angle_util.normalize_yaw(real_yaw - math.pi * 0.5) end
-return angle_util.normalize_yaw(real_yaw + math.rad(settings.num(P_YAW_MANUAL, 90)))
-end
-local function advance_jitter(dt)
-local yaw_m = settings.combo_index(P_YAW, YAW_LABELS, 0)
-if yaw_m ~= YAW_JITTER and yaw_m ~= YAW_RAND then return end
-local interval = math.max(0.04, settings.num(P_JITTER_MS, 120) / 1000)
-state.jitter_t = state.jitter_t + dt
-if state.jitter_t < interval then return end
-state.jitter_t = 0
-local step = math.max(15, settings.num(P_JITTER, 90))
-if yaw_m == YAW_JITTER then
-state.yaw_jitter_idx = (state.yaw_jitter_idx + 1) % math.max(1, math.floor(360 / step))
-end
-if yaw_m == YAW_RAND then
-state.random_yaw = math.random() * math.pi * 2
-end
-end
-local function disable_auto_rotate(lp, hum)
-if lp then pcall(function() lp.AutoRotate = false end) end
-if hum then
-pcall(function() hum.AutoRotate = false end)
-pcall(function() hum.auto_rotate = false end)
-end
-end
-local function restore_auto_rotate(lp, hum)
-if lp then pcall(function() lp.AutoRotate = true end) end
-if hum then
-pcall(function() hum.AutoRotate = true end)
-pcall(function() hum.auto_rotate = true end)
-end
-end
-local function write_yaw(char, root, yaw)
-if yaw == nil or not root or not CFrame then return end
-local pos = move.read_pos(root)
-if not pos then return end
-local cf = CFrame.new(pos.x, pos.y, pos.z) * CFrame.Angles(0, yaw, 0)
-pcall(function() root.CFrame = cf end)
-if char then
-pcall(function()
-if char.PivotTo then char:PivotTo(cf) end
-end)
-end
-end
-local function steer_yaw(root, body_yaw, target_yaw)
-if target_yaw == nil or not root then return end
-local mode = settings.combo_index(P_YAW, YAW_LABELS, 0)
-if mode == YAW_SPIN then
-move.set_angular_velocity(root, 0, math.rad(settings.num(P_SPIN, 180)), 0)
-return
-end
-local diff = angle_util.yaw_delta(body_yaw, target_yaw)
-if math.abs(diff) < YAW_SNAP_EPS then
-move.set_angular_velocity(root, 0, 0, 0)
-return
-end
-local av = diff * YAW_GAIN
-if av > YAW_AV_MAX then av = YAW_AV_MAX elseif av < -YAW_AV_MAX then av = -YAW_AV_MAX end
-move.set_angular_velocity(root, 0, av, 0)
-end
-local function face_camera(lp, char, root, hum)
-local yaw = angle_util.camera_yaw()
-write_yaw(char, root, yaw)
-if root then move.set_angular_velocity(root, 0, 0, 0) end
-restore_auto_rotate(lp, hum)
-end
-local function tick_aa(dt)
-local lp = env.get_local_player()
-local char = get_character(lp)
-local root = get_root(lp)
-local hum = get_humanoid(lp)
-if not root then return end
-disable_auto_rotate(lp, hum)
-advance_jitter(dt)
-local real_yaw = angle_util.camera_yaw()
-local fake_yaw = compute_fake_yaw(real_yaw, dt)
-if fake_yaw == nil then
-move.set_angular_velocity(root, 0, 0, 0)
-return
-end
-state.fake_yaw = fake_yaw
-local body_yaw = angle_util.body_yaw(lp, root)
-write_yaw(char, root, fake_yaw)
-steer_yaw(root, body_yaw, fake_yaw)
-end
-local function sync_option_visibility()
-if not menu or not menu.set_visible then return end
-local on = active()
-local yaw_m = settings.combo_index(P_YAW, YAW_LABELS, 0)
-pcall(menu.set_visible, P_YAW_MANUAL, on and yaw_m == YAW_MANUAL_IDX)
-pcall(menu.set_visible, P_SPIN, on and yaw_m == YAW_SPIN)
-pcall(menu.set_visible, P_JITTER, on and (yaw_m == YAW_JITTER or yaw_m == YAW_RAND))
-pcall(menu.set_visible, P_JITTER_MS, on and (yaw_m == YAW_JITTER or yaw_m == YAW_RAND))
-end
-function M.register_menu()
-local G = menu_util.G
-local T, _ = menu_util.group(G.MISC)
-local root = menu_util.parent(P)
-menu_util.section(T, G.MISC, "Movement")
-menu_util.register_keybind(T, G.MISC, P, "Anti-Aim", false)
-menu.add_combo(T, G.MISC, P_YAW, "Yaw Mode", YAW_LABELS, 1, root)
-menu.add_slider_int(T, G.MISC, P_YAW_MANUAL, "Manual Yaw", -180, 180, 90,
-menu_util.parent(P_YAW, { parent_value = YAW_MANUAL_IDX }))
-menu.add_slider_int(T, G.MISC, P_SPIN, "Spin Speed", 30, 720, 180, root)
-menu.add_slider_int(T, G.MISC, P_JITTER, "Jitter Step", 15, 180, 90, root)
-menu.add_slider_int(T, G.MISC, P_JITTER_MS, "Jitter Interval (ms)", 40, 500, 120, root)
-menu_util.bind_children(P, {
-P_YAW, P_YAW_MANUAL, P_SPIN, P_JITTER, P_JITTER_MS,
-})
-if menu and menu.set_callback then
-pcall(menu.set_callback, P, sync_option_visibility)
-pcall(menu.set_callback, P_YAW, sync_option_visibility)
-end
-sync_option_visibility()
-end
-function M.install() end
-function M.update(dt)
-sync_option_visibility()
-dt = dt or 0.016
-local lp = env.get_local_player()
-local char = get_character(lp)
-local root = get_root(lp)
-local hum = get_humanoid(lp)
-local on = active() and misc_gate.movement_allowed()
-local firing = on and is_firing(char)
-if state.was_active and (not on or firing) then
-if root then move.set_angular_velocity(root, 0, 0, 0) end
-if firing and on then
-face_camera(lp, char, root, hum)
-else
-restore_auto_rotate(lp, hum)
-state.spin_yaw = 0
-state.jitter_t = 0
-end
-end
-if state.was_firing and on and not firing then
-disable_auto_rotate(lp, hum)
-end
-state.was_active = on and not firing
-state.was_firing = firing
-if not on or firing then return end
-if settings.combo_index(P_YAW, YAW_LABELS, 0) == 0 then return end
-tick_aa(dt)
-end
-function M.draw() end
-return M
-end)()
-
-April._mods["features.movement.fake_duck"] = (function()
-local settings = April.require("core.settings")
-local env = April.require("core.env")
-local menu_util = April.require("core.menu_util")
-local move = April.require("core.cframe_move")
-local misc_gate = April.require("core.misc_gate")
-local runservice = April.require("core.runservice")
-local M = {}
-local P = "april_fakeduck_enabled"
-local P_HEIGHT = "april_fakeduck_height"
-local P_SPAM = "april_fakeduck_spam"
-local P_SPAM_MIN = "april_fakeduck_spam_min"
-local P_SPAM_MAX = "april_fakeduck_spam_max"
-local P_SPAM_MS = "april_fakeduck_spam_ms"
-local P_SPAM_MODE = "april_fakeduck_spam_mode"
-local SPAM_MODES = { "Alternating", "Random" }
-local DEFAULT_DUCK_HIP = 1.1
-local STAND_HIP = 1.6
-local HIP_MIN = 0.01
-local HIP_MAX = 1.5
-local SPEED_WALK = 11
-local SPEED_SPRINT = 18
-local SPEED_AIM_MUL = 0.8
-local SPEED_SLOW_MUL = 0.3
-local MOVE_EPS = 0.05
-local state = {
-was_active = false,
-hooks_installed = false,
-state_ctrl = nil,
-viewmodel = nil,
-root = nil,
-hum = nil,
-spam_t = 0,
-spam_hi = false,
-spam_val = DEFAULT_DUCK_HIP,
-}
-local function active()
-return settings.enabled(P)
-end
-local function clamp_hip(h)
-h = tonumber(h) or DEFAULT_DUCK_HIP
-if h > HIP_MAX then h = HIP_MAX end
-if h < HIP_MIN then h = HIP_MIN end
-return h
-end
-local function find_child(parent, name)
-if not parent then return nil end
-return env.safe_call(function()
-if parent.FindFirstChild then return parent:FindFirstChild(name) end
-if parent.find_first_child then return parent:find_first_child(name) end
-return nil
-end)
-end
-local function get_character(lp)
-if not lp then lp = env.get_local_player() end
-if lp then
-local char = lp.Character or lp.character
-if char then return char end
-end
-local rp = game and (game.LocalPlayer or game.local_player)
-if rp then return rp.Character or rp.character end
-return nil
-end
-local function get_attr(inst, name)
-if not inst then return nil end
-return env.safe_call(function()
-if inst.GetAttribute then return inst:GetAttribute(name) end
-if inst.get_attribute then return inst:get_attribute(name) end
-return nil
-end)
-end
-local function set_attr(inst, name, value)
-if not inst then return end
-pcall(function()
-if inst.SetAttribute then
-inst:SetAttribute(name, value)
-elseif inst.set_attribute then
-inst:set_attribute(name, value)
-end
-end)
-end
-local function set_hip_height(hum, value)
-if not hum then return end
-pcall(function() hum.HipHeight = value end)
-end
-local function static_duck_hip()
-return clamp_hip(settings.num(P_HEIGHT, DEFAULT_DUCK_HIP))
-end
-local function spam_range()
-local lo = clamp_hip(settings.num(P_SPAM_MIN, HIP_MIN))
-local hi = clamp_hip(settings.num(P_SPAM_MAX, HIP_MAX))
-if lo > hi then
-lo, hi = hi, lo
-end
-return lo, hi
-end
-local function duck_hip(dt)
-if not settings.bool(P_SPAM, false) then
-state.spam_t = 0
-return static_duck_hip()
-end
-local lo, hi = spam_range()
-local interval = math.max(0.02, settings.num(P_SPAM_MS, 80) / 1000)
-local mode = settings.combo_index(P_SPAM_MODE, SPAM_MODES, 0)
-state.spam_t = (state.spam_t or 0) + (dt or 0.016)
-if state.spam_t >= interval then
-state.spam_t = 0
-if mode == 1 then
-state.spam_val = lo + math.random() * (hi - lo)
-else
-state.spam_hi = not state.spam_hi
-state.spam_val = state.spam_hi and hi or lo
-end
-end
-return clamp_hip(state.spam_val or lo)
-end
-local function set_root_size(root, crouch, hip)
-if not root or not Vector3 then return end
-local y = 2.5
-if crouch then
-hip = hip or DEFAULT_DUCK_HIP
-y = 2.1 - (DEFAULT_DUCK_HIP - hip) * 0.35
-if y < 1.4 then y = 1.4 end
-if y > 2.4 then y = 2.4 end
-end
-pcall(function()
-root.Size = Vector3.new(2, y, 2)
-end)
-end
-local function resolve_parts()
-local lp = env.get_local_player()
-local char = get_character(lp)
-if not char then
-state.state_ctrl, state.viewmodel, state.root, state.hum = nil, nil, nil, nil
-return false
-end
-state.state_ctrl = find_child(char, "StateController")
-state.viewmodel = find_child(char, "ViewmodelController")
-state.root = move.find_part(char, "HumanoidRootPart") or find_child(char, "HumanoidRootPart")
-state.hum = (lp and (lp.Humanoid or lp.humanoid))
-or move.find_part(char, "Humanoid")
-or find_child(char, "Humanoid")
-return state.root ~= nil
-end
-local function desired_speed()
-local sc = state.state_ctrl
-local vm = state.viewmodel
-local hum = state.hum
-local sprint = get_attr(sc, "IsSprint") == true
-local aiming = get_attr(vm, "Aiming") == true
-local slowed = false
-if hum then
-local dc = get_attr(hum, "DamageConnections")
-slowed = type(dc) == "number" and dc > 0
-end
-if get_attr(hum, "Downed") == true then return 0 end
-local base = sprint and SPEED_SPRINT or SPEED_WALK
-if aiming then base = base * SPEED_AIM_MUL end
-if slowed then base = base * SPEED_SLOW_MUL end
-return base
-end
-local function boost_velocity(root, target)
-if not root or not target or target <= 0 then return end
-local mx, mz = move.read_flat_input()
-local vx, vy, vz = move.read_velocity(root)
-local input_mag = math.sqrt(mx * mx + mz * mz)
-if input_mag >= MOVE_EPS then
-move.set_velocity(root, mx * target, vy, mz * target)
-return
-end
-local hmag = math.sqrt(vx * vx + vz * vz)
-if hmag < 1.0 then return end
-if hmag >= target * 0.95 then return end
-local s = target / hmag
-move.set_velocity(root, vx * s, vy, vz * s)
-end
-local function apply_duck(dt)
-if not resolve_parts() then return end
-if state.state_ctrl then
-set_attr(state.state_ctrl, "IsCrouch", true)
-end
-local hip = duck_hip(dt)
-set_hip_height(state.hum, hip)
-set_root_size(state.root, true, hip)
-boost_velocity(state.root, desired_speed())
-end
-local function restore_duck()
-resolve_parts()
-if state.state_ctrl then
-set_attr(state.state_ctrl, "IsCrouch", false)
-end
-set_hip_height(state.hum, STAND_HIP)
-set_root_size(state.root, false)
-state.spam_t = 0
-state.spam_hi = false
-end
-local function on_sim(dt)
-if not misc_gate.movement_allowed() then return end
-local on = active()
-if state.was_active and not on then
-restore_duck()
-end
-state.was_active = on
-if not on then return end
-apply_duck(dt or 0.016)
-end
-local function ensure_hooks()
-if state.hooks_installed then return end
-state.hooks_installed = true
-runservice.on_sim(on_sim)
-end
-function M.register_menu()
-local G = menu_util.G
-local T, _ = menu_util.group(G.MISC)
-local root = menu_util.parent(P)
-local spam_root = menu_util.parent(P_SPAM)
-menu_util.section(T, G.MISC, "Movement")
-menu_util.register_keybind(T, G.MISC, P, "Fake Duck", false)
-menu.add_slider_float(T, G.MISC, P_HEIGHT, "Duck Height", HIP_MIN, HIP_MAX, DEFAULT_DUCK_HIP, "%.2f", root)
-menu.add_checkbox(T, G.MISC, P_SPAM, "Spam Height", false, root)
-menu.add_combo(T, G.MISC, P_SPAM_MODE, "Spam Mode", SPAM_MODES, 0, spam_root)
-menu.add_slider_float(T, G.MISC, P_SPAM_MIN, "Spam Min", HIP_MIN, HIP_MAX, HIP_MIN, "%.2f", spam_root)
-menu.add_slider_float(T, G.MISC, P_SPAM_MAX, "Spam Max", HIP_MIN, HIP_MAX, HIP_MAX, "%.2f", spam_root)
-menu.add_slider_int(T, G.MISC, P_SPAM_MS, "Spam Interval (ms)", 20, 400, 80, spam_root)
-menu_util.bind_children(P, {
-P_HEIGHT, P_SPAM, P_SPAM_MODE, P_SPAM_MIN, P_SPAM_MAX, P_SPAM_MS,
-})
-menu_util.bind_children(P_SPAM, {
-P_SPAM_MODE, P_SPAM_MIN, P_SPAM_MAX, P_SPAM_MS,
-})
-end
-function M.install()
-ensure_hooks()
-end
-function M.update(dt)
-ensure_hooks()
-if not runservice.uses_heartbeat() and misc_gate.movement_allowed() then
-on_sim(dt)
-elseif state.was_active and not active() then
-restore_duck()
-state.was_active = false
-end
-end
-function M.draw() end
-return M
-end)()
-
 April._mods["features.radar.tactical_map"] = (function()
 local settings = April.require("core.settings")
 local draw_util = April.require("core.draw_util")
@@ -24295,7 +23480,7 @@ end
 local function wrap_text(text, max_width, size)
 local lines = {}
 local line = ""
-for word in tostring(text or ""):gmatch("%S+") do
+for word in tostring(text or ""):gmatch("[^ \t\r\n]+") do
 local candidate = line == "" and word or (line .. " " .. word)
 if line ~= "" and text_width(candidate, size) > max_width then
 lines[#lines + 1] = line
@@ -24563,6 +23748,36 @@ end
 function M.try_autoload()
 return store.try_autoload()
 end
+function M.load_nhandzqn()
+store.migrate_legacy()
+local ok, recognized = store.apply_preset_nhandzqn()
+if not ok then
+notify.error("Could not load preset nhandzqn", 4000)
+return false
+end
+if menu and menu.set then
+menu.set("april_cfg_profile_name", "nhandzqn")
+end
+store.save_meta()
+invalidate_config_catalog()
+notify.success(string.format('Loaded preset "nhandzqn" (%d settings)', recognized or 0), 3500)
+return true
+end
+function M.load_default_config()
+local ok_state, state = pcall(April.require, "ui.gs_state")
+if not ok_state or not state or type(state.reset_to_defaults) ~= "function" then
+notify.error("Could not reset to defaults", 4000)
+return false
+end
+local count = state.reset_to_defaults()
+if menu and menu.set then
+menu.set("april_cfg_profile_name", "Default")
+end
+store.save_meta()
+invalidate_config_catalog()
+notify.success(string.format("Reset to default config (%d settings)", count or 0), 3500)
+return true
+end
 function M.register_menu()
 local G = menu_util.G
 local T, _ = menu_util.group(G.CONFIG)
@@ -24588,6 +23803,8 @@ store.refresh_index()
 invalidate_config_catalog()
 notify.info("Config list refreshed", 2000)
 end)
+menu_util.button(T, G.CONFIG, "april_cfg_preset_nhandzqn", "Config nhandzqn", M.load_nhandzqn)
+menu_util.button(T, G.CONFIG, "april_cfg_default", "Config Default", M.load_default_config)
 menu_util.gap(T, G.CONFIG)
 menu.add_checkbox(T, G.CONFIG, "april_cfg_autoload", "Autoload on Start", false)
 menu_util.input(T, G.CONFIG, "april_cfg_autoload_config", "Autoload Config Name", "")
@@ -25258,6 +24475,7 @@ local M = {}
 M.values = {}
 M.defaults = {}
 M.colors = {}
+M.color_defaults = {}
 M.keys = {}
 M.callbacks = {}
 M.menu_callback = {}
@@ -25312,7 +24530,9 @@ end
 function M.define_color(id, color)
 if id == nil then return end
 if M.colors[id] == nil then
-M.colors[id] = copy_table(color or { 1, 1, 1, 1 })
+local default = copy_table(color or { 1, 1, 1, 1 })
+M.colors[id] = default
+M.color_defaults[id] = copy_table(default)
 end
 end
 function M.get_color(id, fallback)
@@ -25322,6 +24542,17 @@ function M.set_color(id, color)
 if id == nil or type(color) ~= "table" then return end
 M.colors[id] = copy_table(color)
 fire_change(id, color)
+end
+function M.reset_to_defaults()
+local count = 0
+for id, default in pairs(M.defaults) do
+M.set(id, copy_table(default))
+count = count + 1
+end
+for id, default in pairs(M.color_defaults) do
+M.set_color(id, copy_table(default))
+end
+return count
 end
 local function normalize_vk(vk)
 vk = tonumber(vk)
@@ -25817,8 +25048,55 @@ end)()
 
 April._mods["ui.i18n"] = (function()
 local M = {}
-M.LANG_ID = "april_ui_russian"
+M.LANG_ID = "april_ui_language"
+M.LEGACY_ID = "april_ui_russian"
+-- Vector's draw font has no Vietnamese glyphs, so VI text is shown unaccented (ASCII).
+local VI_FOLD = {
+    a = "àáảãạăằắẳẵặâầấẩẫậ",
+    A = "ÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬ",
+    e = "èéẻẽẹêềếểễệ",
+    E = "ÈÉẺẼẸÊỀẾỂỄỆ",
+    i = "ìíỉĩị",
+    I = "ÌÍỈĨỊ",
+    o = "òóỏõọôồốổỗộơờớởỡợ",
+    O = "ÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢ",
+    u = "ùúủũụưừứửữự",
+    U = "ÙÚỦŨỤƯỪỨỬỮỰ",
+    y = "ỳýỷỹỵ",
+    Y = "ỲÝỶỸỴ",
+    d = "đ",
+    D = "Đ",
+}
+local VI_COMBINING = {
+    ["\204\128"] = "", ["\204\129"] = "", ["\204\130"] = "", ["\204\131"] = "",
+    ["\204\134"] = "", ["\204\137"] = "", ["\204\155"] = "", ["\204\163"] = "",
+}
+local VI_ASCII = {}
+for ascii, chars in pairs(VI_FOLD) do
+    local i = 1
+    while i <= #chars do
+        local b = chars:byte(i)
+        local len = 1
+        if b >= 240 then len = 4
+        elseif b >= 224 then len = 3
+        elseif b >= 192 then len = 2 end
+        VI_ASCII[chars:sub(i, i + len - 1)] = ascii
+        i = i + len
+    end
+end
+local function vi_fold_char(ch)
+    return VI_ASCII[ch] or VI_COMBINING[ch] or ch
+end
+local function strip_vi(text)
+    if type(text) ~= "string" or text == "" then return text end
+    return (text:gsub("[\1-\127\194-\244][\128-\191]*", vi_fold_char))
+end
+M.fold_vi = strip_vi
 local STRINGS = {
+    ["Language"] = "Yazyk",
+    ["English"] = "Angliyskiy",
+    ["Russian"] = "Russkiy",
+    ["Tieng Viet"] = "Vetnamskiy",
     ["Aim"] = "Aim",
     ["Aimbot"] = "Aimbot",
     ["Visuals"] = "Vizualy",
@@ -26269,6 +25547,12 @@ local STRINGS = {
     ["Load Config"] = "Zagruzit konfig",
     ["Delete Config"] = "Udalit konfig",
     ["Refresh List"] = "Obnovit spisok",
+    ["Share"] = "Podelitsya",
+    ["Export to Clipboard"] = "Eksport v bufer",
+    ["Import from Clipboard"] = "Import iz bufera",
+    ["Pasted Config"] = "Vstavlennyy konfig",
+    ["Apply Import"] = "Primenit import",
+    ["Cancel Import"] = "Otmenit import",
     ["Autoload"] = "Avtozagruzka",
     ["Autoload on Start"] = "Avtozagruzka pri starte",
     ["Autoload Config Name"] = "Imya avtozagruzhaemogo konfiga",
@@ -26337,6 +25621,7 @@ local STRINGS = {
 }
 local TIPS = {
     april_ui_russian = "Pereklyuchaet ves interfeys April i tekst HUD na russkiy (latinitsey — shrift Vector ne risuet kirillitsu).",
+    april_ui_language = "Pereklyuchaet ves interfeys April, HUD i podskazki na vybrannyy yazyk (Angliyskiy, Russkiy ili Vetnamskiy).",
     april_aimbot = "Plavnyy aim assist kameroy po tekuschey tseli. Bind na chipe (Vsegda / Uderzhanie / Pereklyuchenie).",
     april_aim_key = "Uderzhivayte ili pereklyuchayte etu klavishu, chtoby aktivirovat aimbot.",
     april_aim_targets = "Vyberite, tselitsya li aimbot v igrokov, NPC ili i teh i drugih.",
@@ -26362,10 +25647,6 @@ local TIPS = {
     april_target_overlay = "Pokazyvaet imya, HP, distantsiyu, oruzhie i snaryazhenie igroka, blizhayshego k pritselu.",
     april_target_overlay_fov = "Otdelnyy FOV (pikseli ot pritsela) tolko dlya Target Gear Overlay.",
     april_target_overlay_max_dist = "Maksimalnaya mirovaya distantsiya (studs) dlya vybora Target Gear Overlay.",
-    april_crosshair_enabled = "Risuet svoy pritsel na ekrane.",
-    april_crosshair_follow = "Dvigaet pritsel k aktivnoy boevoy tseli.",
-    april_ui_crosshair_motion = "Dobavlyaet vraschenie ili puls k pritselu.",
-    april_ui_crosshair_options = "Dopolnitelnye optsii otrisovki pritsela.",
     april_world_enabled = "Podsvechivaet sobiraemye resursy i zhivotnyh v mire.",
     april_loot_enabled = "Podsvechivaet yaschiki, sumki i drugoy lut v mire.",
     april_base_enabled = "Podsvechivaet chasti bazy: dveri, tureli i hranilischa.",
@@ -26395,10 +25676,6 @@ local TIPS = {
     april_npc_zombie = "Pokazyvaet Zombie NPC na ESP.",
     april_npc_tracers = "Risuet trassery k NPC, kogda vklyuchen NPC ESP.",
     april_npc_offscreen = "Risuet strelki k NPC vne ekrana.",
-    april_desync_enabled = "Rassinhroniziruet setevuyu pozitsiyu s tem, gde vy vyglyadite.",
-    april_antiaim_enabled = "Podmenyaet napravlenie vzglyada dlya drugih igrokov.",
-    april_fakeduck_enabled = "Bystro menyaet vysotu hitboksa (prised).",
-    april_fling_enabled = "Podbrasyvaet blizhayshie suschnosti vverh.",
     april_autofarm = "Avtomaticheski povorachivaetsya i bezhit k vybrannym resursam, proveryaet vidimost i tsentr zhivoy weak point, zatem bet sovmestimym instrumentom. Vector dolzhen byt na perednem plane — dvizhenie i kliki idut cherez OS input.",
     april_autofarm_resources = "Vyberite vse tipy resursov, kotorye avtofarm mozhet poseschat. Instrument v rukah dolzhen podhodit: topory dlya derevev, kirki dlya uzlov ili sovmestimyy gibrid.",
     april_autofarm_search_range = "Maksimalnaya distantsiya v studs pri poiske sleduyuschego resursa. Bolshe — shire zona, no marshruty mogut byt dlinnee.",
@@ -26461,28 +25738,6 @@ local TIPS = {
     april_raid_range = "Maksimalnaya distantsiya ESP reydov.",
     april_target_overlay_gear_size = "Razmer ikonok snaryazheniya v overlee tseli.",
     april_target_overlay_top = "Vertikalnyy otstup paneli snaryazheniya tseli.",
-    april_crosshair_type = "Forma svoego pritsela.",
-    april_crosshair_source = "Otkuda brat tsel dlya sledovaniya pritsela.",
-    april_crosshair_follow_smooth = "Naskolko plavno pritsel sleduet za tselyu.",
-    april_crosshair_spin_speed = "Skorost vrascheniya pritsela.",
-    april_crosshair_pulse_speed = "Skorost pulsatsii razmera pritsela.",
-    april_crosshair_rainbow_speed = "Skorost raduzhnogo tsikla tsveta pritsela.",
-    april_crosshair_size = "Razmer pritsela.",
-    april_crosshair_gap = "Zazor v tsentre pritsela.",
-    april_crosshair_thickness = "Tolschina liniy pritsela.",
-    april_crosshair_color = "Tsvet pritsela.",
-    april_antiaim_yaw_mode = "Kak podmenyat yaw dlya drugih igrokov.",
-    april_antiaim_yaw_manual = "Ruchnoe znachenie yaw v rezhime Manual.",
-    april_antiaim_spin_speed = "Skorost vrascheniya yaw v rezhime Spin.",
-    april_antiaim_jitter_step = "Shag ugla dzhittera.",
-    april_antiaim_jitter_ms = "Interval smeny dzhittera v millisekundah.",
-    april_fakeduck_height = "Tselevaya vysota priseda Fake Duck.",
-    april_fakeduck_spam_mode = "Kak spamit vysotu: cheredovanie ili sluchayno.",
-    april_fakeduck_spam_min = "Minimalnaya vysota pri spame.",
-    april_fakeduck_spam_max = "Maksimalnaya vysota pri spame.",
-    april_fakeduck_spam_ms = "Interval spama vysoty v millisekundah.",
-    april_fling_fov = "FOV vybora tseli dlya Fling.",
-    april_fling_duration = "Dlitelnost effekta Fling.",
     april_farm_radius = "Radius ruchnogo pomoschnika farma v studs.",
     april_mod_checker_interval = "Kak chasto skanirovat lobbi na personal.",
     april_map_zoom = "Uroven zuma takticheskoy karty.",
@@ -26563,56 +25818,917 @@ local TIPS = {
     april_solar_panel = "Podsvechivaet solnechnye paneli na ESP bazy.",
     april_windmill = "Podsvechivaet vetryaki na ESP bazy.",
 }
+local STRINGS_VI = {
+    ["(no configs)"] = "(chưa có cấu hình)",
+    ["2D"] = "2D",
+    ["Accent"] = "Màu nhấn",
+    ["Accent Colors"] = "Màu nhấn",
+    ["Accent Speed"] = "Tốc độ màu nhấn",
+    ["Accent Style"] = "Kiểu màu nhấn",
+    ["Adaptive"] = "Thích ứng",
+    ["Adds a small dot at the exact screen center."] = "Thêm một chấm nhỏ ngay giữa màn hình.",
+    ["Adds light drift and overshoot so mouse aim feels less robotic."] = "Thêm độ lệch nhẹ và vượt đà để ngắm chuột tự nhiên hơn.",
+    ["Adds spin or pulse animation to the crosshair."] = "Thêm hiệu ứng xoay hoặc nhịp đập cho tâm ngắm.",
+    ["Advanced"] = "Nâng cao",
+    ["Advanced Animation"] = "Hiệu ứng nâng cao",
+    ["Aim"] = "Ngắm",
+    ["Aim At"] = "Ngắm vào",
+    ["Aim Key"] = "Phím ngắm",
+    ["Aimbot"] = "Aimbot",
+    ["Aims at the head for the highest usual damage."] = "Ngắm vào đầu để có sát thương cao nhất.",
+    ["Aims at the target's left arm."] = "Ngắm vào cánh tay trái của mục tiêu.",
+    ["Aims at the target's left leg."] = "Ngắm vào chân trái của mục tiêu.",
+    ["Aims at the target's right arm."] = "Ngắm vào cánh tay phải của mục tiêu.",
+    ["Aims at the target's right leg."] = "Ngắm vào chân phải của mục tiêu.",
+    ["Aims at the torso for a larger, steadier target."] = "Ngắm vào thân để mục tiêu lớn và ổn định hơn.",
+    ["Alerts you when staff or mods join the server."] = "Báo cho bạn khi staff hoặc mod vào server.",
+    ["Allows Autofarm to harvest tree models. Equip an axe, hatchet, chainsaw, or compatible hybrid tool."] = "Cho phép Autofarm chặt cây. Trang bị rìu, rìu nhỏ, cưa máy hoặc dụng cụ lai tương thích.",
+    ["Allows Autofarm to mine Metal_Node models. Equip a pickaxe, mining drill, or compatible hybrid tool."] = "Cho phép Autofarm khai thác quặng kim loại (Metal_Node). Trang bị cuốc chim, máy khoan hoặc dụng cụ lai tương thích.",
+    ["Allows Autofarm to mine Phosphate_Node models. Equip a pickaxe, mining drill, or compatible hybrid tool."] = "Cho phép Autofarm khai thác quặng phốt phát (Phosphate_Node). Trang bị cuốc chim, máy khoan hoặc dụng cụ lai tương thích.",
+    ["Allows Autofarm to mine Stone_Node models. Equip a pickaxe, mining drill, or compatible hybrid tool."] = "Cho phép Autofarm khai thác đá (Stone_Node). Trang bị cuốc chim, máy khoan hoặc dụng cụ lai tương thích.",
+    ["Also cancels the left and right recoil, not just the climb."] = "Triệt cả giật trái phải, không chỉ giật lên.",
+    ["Also toggled from the top dock."] = "Cũng có thể bật/tắt từ thanh trên cùng.",
+    ["Alternating"] = "Xen kẽ",
+    ["Always"] = "Luôn bật",
+    ["Amber Noir"] = "Hổ phách đen",
+    ["Ambient Fade Pulse"] = "Nhịp mờ nền",
+    ["Amount"] = "Số lượng",
+    ["Animate"] = "Hiệu ứng động",
+    ["Animation"] = "Hiệu ứng",
+    ["Anime Baddie"] = "Anime Baddie",
+    ["Anti-Aim"] = "Chống ngắm",
+    ["Appearance"] = "Giao diện",
+    ["Appearance, motion, profiles, and extras"] = "Giao diện, chuyển động, cấu hình và tiện ích",
+    ["April"] = "April",
+    ["Arctic Frost"] = "Băng tuyết",
+    ["Attack Heli"] = "Trực thăng tấn công",
+    ["Auto"] = "Tự động",
+    ["Auto Prediction"] = "Dự đoán tự động",
+    ["Auto Turret"] = "Trụ tự động",
+    ["Auto Turret Range Ring"] = "Vòng tầm trụ tự động",
+    ["Autofarm"] = "Autofarm",
+    ["Autoload"] = "Tự tải",
+    ["Autoload Config Name"] = "Tên cấu hình tự tải",
+    ["Autoload on Start"] = "Tự tải khi khởi động",
+    ["Automatically moves faster on large misses and slows down for small corrections."] = "Tự tăng tốc khi lệch nhiều và giảm tốc khi cần chỉnh nhẹ.",
+    ["Automatically turns and runs to selected resources, verifies the live weak point is visible and centered, then swings using the equipped compatible tool. Vector must be the foreground window because movement and clicks use OS input."] = "Tự xoay và chạy tới tài nguyên đã chọn, kiểm tra điểm yếu đang hiện rõ và nằm giữa, rồi vung dụng cụ tương thích đang trang bị. Cửa sổ Vector phải ở tiền cảnh vì di chuyển và nhấp dùng input hệ điều hành.",
+    ["Automatically uses the valid body part closest to your crosshair."] = "Tự dùng bộ phận cơ thể hợp lệ gần tâm ngắm nhất.",
+    ["Automation"] = "Tự động hóa",
+    ["BTR"] = "BTR",
+    ["BTR Crate"] = "Thùng BTR",
+    ["Backdrop"] = "Nền mờ",
+    ["Backwards"] = "Giật lùi",
+    ["Balanced"] = "Cân bằng",
+    ["Base 3D Boxes"] = "Khung 3D căn cứ",
+    ["Base Cabinet"] = "Tủ căn cứ",
+    ["Base ESP"] = "ESP căn cứ",
+    ["Base Parts"] = "Cấu kiện căn cứ",
+    ["Base Range"] = "Phạm vi căn cứ",
+    ["Base Show Distance"] = "Hiện khoảng cách căn cứ",
+    ["Base Show Name"] = "Hiện tên căn cứ",
+    ["Base Xray"] = "Xray căn cứ",
+    ["Bases"] = "Căn cứ",
+    ["Basics"] = "Cơ bản",
+    ["Behavior"] = "Hành vi",
+    ["Binds"] = "Phím tắt",
+    ["Blue"] = "Xanh dương",
+    ["Blueberry Plant"] = "Cây việt quất",
+    ["Boar"] = "Lợn rừng",
+    ["Body Bag"] = "Túi xác",
+    ["Border Strength %"] = "Độ đậm viền %",
+    ["Boris"] = "Boris",
+    ["Box"] = "Khung",
+    ["Brackets"] = "Ngoặc",
+    ["Bruno"] = "Bruno",
+    ["Brutus"] = "Brutus",
+    ["Bubble Duration"] = "Thời gian bong bóng",
+    ["COLOR"] = "MÀU SẮC",
+    ["Cancels recoil only. Move your mouse freely; it learns your sensitivity."] = "Chỉ triệt giật súng. Bạn vẫn di chuột tự do; hệ thống tự học độ nhạy.",
+    ["Care Package"] = "Thùng tiếp tế",
+    ["Center Dot"] = "Chấm giữa",
+    ["Center Dot Color"] = "Màu chấm giữa",
+    ["Cham Types"] = "Loại chams",
+    ["Chams Mode"] = "Chế độ chams",
+    ["Chams on players. Engine is Vector's chams on the real body (like ahook); Overlay draws Vector's chams renderer in any color."] = "Chams cho người chơi. Engine là chams của Vector trên thân thật (như ahook); Overlay vẽ bộ dựng chams của Vector với màu bất kỳ.",
+    ["Chams on the NPC types ticked above. Engine is Vector's chams on the real body (like ahook); Overlay draws Vector's chams renderer in any color."] = "Chams cho loại NPC đã chọn ở trên. Engine là chams của Vector trên thân thật (như ahook); Overlay vẽ bộ dựng chams của Vector với màu bất kỳ.",
+    ["Changes character transparency. The speech bubble stays nearly opaque for readability."] = "Đổi độ trong suốt của nhân vật. Bong bóng thoại vẫn gần như đục để dễ đọc.",
+    ["Changes the waist-up character size."] = "Đổi kích cỡ nhân vật (từ eo trở lên).",
+    ["Character"] = "Nhân vật",
+    ["Chatter Cooldown"] = "Hồi thoại",
+    ["Cheater"] = "Nghi hack",
+    ["Choose what appears on the tactical map."] = "Chọn nội dung hiển thị trên bản đồ chiến thuật.",
+    ["Choose whether aimbot targets players, NPCs, or both."] = "Chọn Aimbot nhắm người chơi, NPC hay cả hai.",
+    ["Choose which NPC types appear on ESP."] = "Chọn loại NPC xuất hiện trên ESP.",
+    ["Choose which info to show on NPC ESP."] = "Chọn thông tin hiển thị trên ESP NPC.",
+    ["Choose which info to show on player ESP."] = "Chọn thông tin hiển thị trên ESP người chơi.",
+    ["Circle"] = "Tròn",
+    ["Clan Tag"] = "Bang hội",
+    ["Clear Whitelist"] = "Xóa danh sách trắng",
+    ["Clears the aim whitelist player list."] = "Xóa danh sách người chơi trong danh sách trắng ngắm.",
+    ["Clicks every 5-10ms while a target can be hit, so your gun fires the moment it is ready. Every click checks again that the part is in plain sight, so it stops the instant the target is behind cover. Bows fire while you hold right click to draw. It only clicks while your cursor is over the game."] = "Nhấp mỗi 5-10ms khi có thể trúng mục tiêu, nên súng bắn ngay khi sẵn sàng. Mỗi lần nhấp kiểm tra lại bộ phận có nhìn thấy rõ, dừng ngay khi mục tiêu núp. Cung bắn khi bạn giữ chuột phải để kéo dây. Chỉ nhấp khi con trỏ nằm trên game.",
+    ["Closest"] = "Gần nhất",
+    ["Color for the Animation ESP side flag ([RELOAD], [HEAL], …)."] = "Màu nhãn hiệu ứng bên hông ESP ([RELOAD], [HEAL], …).",
+    ["Combat"] = "Chiến đấu",
+    ["Combat / Bleed"] = "Giao chiến / Chảy máu",
+    ["Combat Movement"] = "Di chuyển chiến đấu",
+    ["Comfortable"] = "Thoải mái",
+    ["Comma-separated Roblox user IDs that Aimbot must ignore. Enable Whitelist inside Filters first. You can also middle-click the current player target to add or remove them."] = "ID Roblox cách nhau bằng dấu phẩy mà Aimbot phải bỏ qua. Bật Danh sách trắng trong Bộ lọc trước. Cũng có thể nhấp chuột giữa vào mục tiêu để thêm hoặc xóa.",
+    ["Compact"] = "Gọn",
+    ["Config"] = "Cài đặt",
+    ["Config Name"] = "Tên cấu hình",
+    ["Config name to load on start. Falls back to your old Autoload Slot if needed."] = "Tên cấu hình tải khi khởi động. Tự dùng Autoload Slot cũ nếu cần.",
+    ["Configs"] = "Cấu hình",
+    ["Continuously rotates the visual while enabled."] = "Liên tục xoay hiệu ứng khi bật.",
+    ["Copper Dust"] = "Bụi đồng",
+    ["Copy Color"] = "Sao chép màu",
+    ["Core"] = "Lõi",
+    ["Corn Plant"] = "Cây ngô",
+    ["Corner"] = "Góc",
+    ["Corners"] = "Bo góc",
+    ["Crimson Ember"] = "Than hồng",
+    ["Cross"] = "Chữ thập",
+    ["Crosshair"] = "Tâm ngắm",
+    ["Crosshair Color"] = "Màu tâm ngắm",
+    ["Crosshair: the target nearest your crosshair. Closest: the target nearest to you. Either way it has to be inside the FOV."] = "Tâm ngắm: mục tiêu gần tâm ngắm nhất. Gần nhất: mục tiêu gần bạn nhất. Cả hai đều phải nằm trong FOV.",
+    ["Cursor Dot"] = "Chấm con trỏ",
+    ["Custom Colors"] = "Màu tùy chỉnh",
+    ["Custom Crosshair"] = "Tâm ngắm tùy chỉnh",
+    ["Cyan"] = "Xanh lơ",
+    ["Cycles the visual through rainbow colors."] = "Đổi màu hiệu ứng theo cầu vồng.",
+    ["Darkens the whole screen behind the menu with a smooth fade. Does not cover menu controls."] = "Làm tối toàn màn hình phía sau menu với hiệu ứng mờ mượt. Không che các nút điều khiển menu.",
+    ["Death / Respawn"] = "Chết / Hồi sinh",
+    ["Debug Target Path"] = "Gỡ lỗi đường ngắm",
+    ["Deer"] = "Hươu",
+    ["Default"] = "Mặc định",
+    ["Delete Config"] = "Xóa cấu hình",
+    ["Deletes the selected config file from April_configs."] = "Xóa file cấu hình đã chọn khỏi April_configs.",
+    ["Density"] = "Mật độ",
+    ["Desync"] = "Desync",
+    ["Desync Visualize"] = "Hiện Desync",
+    ["Desyncs your network position from where you appear."] = "Làm vị trí mạng của bạn lệch so với nơi bạn hiển thị.",
+    ["Diamond"] = "Kim cương",
+    ["Disables this visual or selection."] = "Tắt hiệu ứng hoặc lựa chọn này.",
+    ["Displayed Elements"] = "Thành phần hiển thị",
+    ["Distance"] = "Khoảng cách",
+    ["Diver Dave"] = "Diver Dave",
+    ["Dot"] = "Chấm",
+    ["Downed"] = "Gục ngã",
+    ["Downed / Revived"] = "Gục / Hồi sinh",
+    ["Draws 3D boxes around visible base parts."] = "Vẽ khung 3D quanh bộ phận căn cứ nhìn thấy.",
+    ["Draws 3D boxes around visible loot."] = "Vẽ khung 3D quanh vật phẩm nhìn thấy.",
+    ["Draws 3D boxes around visible resources."] = "Vẽ khung 3D quanh tài nguyên nhìn thấy.",
+    ["Draws a custom crosshair on screen."] = "Vẽ tâm ngắm tùy chỉnh trên màn hình.",
+    ["Draws a line for each of your shots, from your gun to where it lands. Drawn on top of everything, so tracers always show through walls."] = "Vẽ đường cho mỗi phát bắn, từ súng tới điểm đạn rơi. Vẽ trên mọi thứ nên đường đạn luôn xuyên tường.",
+    ["Draws a tracer to the exact TreeX or NodeSpark point plus the current state, distance, and held tool."] = "Vẽ đường chỉ tới đúng điểm TreeX hoặc NodeSpark kèm trạng thái hiện tại, khoảng cách và dụng cụ đang cầm.",
+    ["Draws a translucent filled circle with an outline."] = "Vẽ vòng tròn trong suốt có viền.",
+    ["Draws lines between the target's body joints."] = "Vẽ đường nối các khớp của mục tiêu.",
+    ["Draws off-screen arrows pointing to NPCs outside the view."] = "Vẽ mũi tên ngoài màn hình chỉ tới NPC ngoài tầm nhìn.",
+    ["Draws only the outside edge."] = "Chỉ vẽ viền ngoài.",
+    ["Draws tracers to tracked NPCs while NPC ESP is on."] = "Vẽ đường đạn tới NPC được theo dõi khi bật ESP NPC.",
+    ["Dropped Items"] = "Vật phẩm rơi",
+    ["Duck Height"] = "Độ cao ngồi",
+    ["ESP Filters"] = "Bộ lọc ESP",
+    ["ESP Flags"] = "Nhãn ESP",
+    ["ESP Text Size"] = "Cỡ chữ ESP",
+    ["EVENT STATUS"] = "TRẠNG THÁI SỰ KIỆN",
+    ["EVENTS"] = "SỰ KIỆN",
+    ["Ease In-Out"] = "Mượt hai đầu",
+    ["Ease Out"] = "Giảm dần",
+    ["Emerald Glass"] = "Kính ngọc lục bảo",
+    ["Enable Aimbot"] = "Bật Aimbot",
+    ["Enable Binds, Staff, Events, Map, or April above."] = "Bật Phím tắt, Staff, Sự kiện, Bản đồ hoặc April ở trên.",
+    ["Enable Snow"] = "Bật tuyết",
+    ["English"] = "Tiếng Anh",
+    ["Event Status"] = "Trạng thái sự kiện",
+    ["Events"] = "Sự kiện",
+    ["Exponential"] = "Lũy thừa",
+    ["Expressive"] = "Biểu cảm",
+    ["Extra crosshair drawing options."] = "Tùy chọn vẽ tâm ngắm bổ sung.",
+    ["Extras"] = "Tiện ích thêm",
+    ["FOV Circle"] = "Vòng FOV",
+    ["FOV Radius (px)"] = "Bán kính FOV (px)",
+    ["FOV Style"] = "Kiểu FOV",
+    ["Fade"] = "Mờ dần",
+    ["Failed: "] = "Lỗi: ",
+    ["Fake Duck"] = "Ngồi giả",
+    ["Farm Range (studs)"] = "Tầm farm (studs)",
+    ["Farm Resources"] = "Tài nguyên farm",
+    ["Feature"] = "Tính năng",
+    ["Features"] = "Tính năng",
+    ["Feedback"] = "Phản hồi",
+    ["Fill"] = "Tô đầy",
+    ["Fill Glow"] = "Tô phát sáng",
+    ["Fill, Wireframe, Fill Glow, or Wireframe Glow."] = "Tô đầy, Khung lưới, Tô phát sáng hoặc Khung lưới phát sáng.",
+    ["Filled Circle"] = "Vòng tròn đặc",
+    ["Fills the FOV circle. Set the fill color and how see-through it is with the color box."] = "Tô đầy vòng FOV. Đặt màu tô và độ trong suốt bằng ô màu.",
+    ["Filter which players appear on ESP."] = "Lọc người chơi xuất hiện trên ESP.",
+    ["Filters"] = "Bộ lọc",
+    ["Filters which targets aimbot will consider."] = "Lọc những mục tiêu Aimbot sẽ xét.",
+    ["Finds a target part in the FOV that's in plain sight and that a shot can really reach for at least Min Damage, sends the shot there, and with Auto Fire pulls the trigger for you."] = "Tìm bộ phận mục tiêu trong FOV nhìn thấy rõ và đạn thật sự tới được với ít nhất Sát thương tối thiểu, bắn vào đó, và với Tự động bắn sẽ bóp cò giúp bạn.",
+    ["Fling"] = "Hất văng",
+    ["Fling Duration"] = "Thời gian hất",
+    ["Fling FOV"] = "FOV hất",
+    ["Flow"] = "Chảy",
+    ["Follow Smoothness"] = "Độ mượt bám",
+    ["Follow Target"] = "Bám mục tiêu",
+    ["Follows the regular camera Aimbot's current target."] = "Bám theo mục tiêu hiện tại của Aimbot thường.",
+    ["Food Crate"] = "Thùng thực phẩm",
+    ["GPU mesh chams on selected base structures (in-range only)."] = "Chams lưới GPU trên cấu trúc căn cứ đã chọn (chỉ trong tầm).",
+    ["GPU mesh chams on selected loot types (in-range only)."] = "Chams lưới GPU trên loại vật phẩm đã chọn (chỉ trong tầm).",
+    ["GPU mesh chams on selected resource types (in-range only)."] = "Chams lưới GPU trên loại tài nguyên đã chọn (chỉ trong tầm).",
+    ["Game Data"] = "Dữ liệu game",
+    ["Gap"] = "Khoảng hở",
+    ["Garage Door"] = "Cửa gara",
+    ["Gear FOV"] = "FOV trang bị",
+    ["Gear Icon Size"] = "Cỡ icon trang bị",
+    ["Glow Preset"] = "Màu phát sáng",
+    ["Glow preset color (Fill Glow / Wireframe Glow only)."] = "Màu phát sáng (chỉ Tô phát sáng / Khung lưới phát sáng).",
+    ["Graphite"] = "Than chì",
+    ["Green"] = "Xanh lá",
+    ["HUD SETTINGS"] = "CÀI ĐẶT HUD",
+    ["HUD panels are managed from the top dock."] = "Các bảng HUD được quản lý từ thanh trên cùng.",
+    ["Head"] = "Đầu",
+    ["Health Bar"] = "Thanh máu",
+    ["Health Check"] = "Kiểm tra máu",
+    ["Held Item"] = "Vật đang cầm",
+    ["Heli Crate"] = "Thùng trực thăng",
+    ["Hide from keybind list"] = "Ẩn khỏi danh sách phím",
+    ["Hides inactive event rows from the event status panel."] = "Ẩn các dòng sự kiện không hoạt động khỏi bảng trạng thái sự kiện.",
+    ["Hides your first-person arms, whatever you are holding."] = "Ẩn cánh tay góc nhìn thứ nhất, bất kể đang cầm gì.",
+    ["Higher values move the camera slower toward the target."] = "Giá trị càng cao camera càng di chuyển chậm tới mục tiêu.",
+    ["Highlights NPC soldiers, bosses, helis, and BTR."] = "Làm nổi bật lính NPC, trùm, trực thăng và BTR.",
+    ["Highlights base parts like doors, turrets, and storage."] = "Làm nổi bật các bộ phận căn cứ như cửa, trụ và kho chứa.",
+    ["Highlights crates, bags, and other loot in the world."] = "Làm nổi bật thùng, túi và vật phẩm khác trong thế giới.",
+    ["Highlights harvestable resources and animals in the world."] = "Làm nổi bật tài nguyên có thể thu hoạch và động vật trong thế giới.",
+    ["Hitbox"] = "Vùng trúng",
+    ["Hold"] = "Giữ",
+    ["Hold or toggle this key to activate aimbot."] = "Giữ hoặc bật/tắt phím này để kích hoạt Aimbot.",
+    ["Hover"] = "Lơ lửng",
+    ["How human the control looks. 0% = removes all recoil, 100% = leaves a random 3% to 40% of the recoil, changing every 0.3 to 0.7 seconds."] = "Mức tự nhiên của việc kiểm soát. 0% = loại bỏ toàn bộ giật, 100% = giữ lại ngẫu nhiên 3% đến 40% độ giật, đổi mỗi 0,3 đến 0,7 giây.",
+    ["How long each speech bubble remains visible."] = "Thời gian mỗi bong bóng thoại hiển thị.",
+    ["How much recoil to remove. 100% = close to no recoil."] = "Lượng giật được loại bỏ. 100% = gần như không giật.",
+    ["How smoothing accelerates: Linear, Ease Out, Ease In-Out, Exponential, or Adaptive."] = "Cách tăng tốc độ mượt: Tuyến tính, Giảm dần, Mượt hai đầu, Lũy thừa hoặc Thích ứng.",
+    ["How strong humanize drift and overshoot are."] = "Độ mạnh của lệch và vượt đà khi giả lập người.",
+    ["Humanize"] = "Giả lập người",
+    ["Humanize %"] = "Giả lập %",
+    ["Humanize Strength"] = "Độ giả lập",
+    ["Idle"] = "Chờ",
+    ["If the fixed Hit Part is blocked or does too little damage, try the other body parts. Closest and Random always move on to another ticked part."] = "Nếu Bộ phận trúng cố định bị chặn hoặc sát thương quá thấp, thử bộ phận khác. Gần nhất và Ngẫu nhiên luôn chuyển sang bộ phận đã chọn khác.",
+    ["Ignores downed players and looks for a target that is still standing."] = "Bỏ qua người chơi đã gục và tìm mục tiêu còn đứng.",
+    ["Ignores players on your team. This applies to players only, not NPC types."] = "Bỏ qua người chơi cùng đội. Chỉ áp dụng cho người chơi, không áp dụng cho NPC.",
+    ["Ignores players protected by a safezone so the aim system does not lock onto targets you cannot damage."] = "Bỏ qua người chơi trong vùng an toàn để hệ thống ngắm không khóa mục tiêu không thể gây sát thương.",
+    ["Independent FOV (pixels from crosshair) used only by Target Gear Overlay."] = "FOV riêng (pixel tính từ tâm ngắm) chỉ dùng cho Bảng trang bị mục tiêu.",
+    ["Interface"] = "Giao diện",
+    ["Jitter"] = "Giật",
+    ["Jitter Interval (ms)"] = "Chu kỳ giật (ms)",
+    ["Jitter Step"] = "Bước giật",
+    ["KEYBIND SETTINGS"] = "CÀI ĐẶT PHÍM",
+    ["KEYBINDS"] = "PHÍM TẮT",
+    ["Keeps the character visible between comments. Disable for event-only popups."] = "Giữ nhân vật hiển thị giữa các câu. Tắt nếu chỉ muốn hiện khi có sự kiện.",
+    ["Keeps the current target locked according to that aim system's sticky rules."] = "Giữ khóa mục tiêu hiện tại theo quy tắc bám của hệ thống ngắm đó.",
+    ["Key used to open and close this menu."] = "Phím dùng để mở và đóng menu này.",
+    ["Keybinds Display"] = "Hiển thị phím tắt",
+    ["Labels"] = "Nhãn",
+    ["Language"] = "Ngôn ngữ",
+    ["Large Battery"] = "Pin lớn",
+    ["Large Egg / Gift"] = "Trứng / Quà lớn",
+    ["Large Storage Box"] = "Hộp chứa lớn",
+    ["Launches nearby entities upward."] = "Hất các thực thể gần đó lên cao.",
+    ["Leads moving targets using weapon bullet speed and drop. Off = aim the bone only. Also skips prediction when you are not holding a gun."] = "Bắn đón mục tiêu di chuyển theo tốc độ đạn và độ rơi. Tắt = chỉ ngắm vào xương. Cũng bỏ dự đoán khi không cầm súng.",
+    ["Left Arm"] = "Tay trái",
+    ["Left Leg"] = "Chân trái",
+    ["Lemon Plant"] = "Cây chanh",
+    ["Linear"] = "Tuyến tính",
+    ["Load Config"] = "Tải cấu hình",
+    ["Loading "] = "Đang tải ",
+    ["Loading modules"] = "Đang tải module",
+    ["Loads the selected / named config from April_configs."] = "Tải cấu hình đã chọn / đã đặt tên từ April_configs.",
+    ["Loads your named config automatically on inject."] = "Tự tải cấu hình đã đặt tên khi inject.",
+    ["Look"] = "Diện mạo",
+    ["Loot"] = "Vật phẩm",
+    ["Loot 3D Boxes"] = "Khung 3D vật phẩm",
+    ["Loot ESP"] = "ESP vật phẩm",
+    ["Loot Range"] = "Phạm vi vật phẩm",
+    ["Loot Show Distance"] = "Hiện khoảng cách vật phẩm",
+    ["Loot Show Name"] = "Hiện tên vật phẩm",
+    ["Low Health"] = "Máu thấp",
+    ["MAP"] = "BẢN ĐỒ",
+    ["Made by ThanhNhan"] = "ThanhNhan tạo",
+    ["Magenta"] = "Hồng sen",
+    ["Magic Bullet: the shot starts right in front of the part and can't miss. Silent Aim: the shot goes from your camera straight at the part. Neither leads the target, and both only shoot parts in plain sight."] = "Magic Bullet: đạn xuất phát ngay trước bộ phận và không thể trượt. Silent Aim: đạn đi từ camera thẳng tới bộ phận. Cả hai không bắn đón và chỉ bắn bộ phận nhìn thấy rõ.",
+    ["Main Accent"] = "Màu nhấn chính",
+    ["Manual"] = "Thủ công",
+    ["Manual Farm Helper"] = "Hỗ trợ farm thủ công",
+    ["Manual Yaw"] = "Xoay thủ công",
+    ["Manual alternative to Autofarm. It redirects your held melee swings to the nearest compatible weak point, but you move and hold attack yourself."] = "Bản thủ công của Autofarm. Nó hướng cú vung cận chiến của bạn vào điểm yếu tương thích gần nhất, còn bạn tự di chuyển và giữ nút tấn công.",
+    ["Map"] = "Bản đồ",
+    ["Marks explosion clusters as potential raids."] = "Đánh dấu cụm vụ nổ là đột kích tiềm năng.",
+    ["Master switch for loot mesh chams."] = "Công tắc tổng cho chams lưới vật phẩm.",
+    ["Master switch for resource mesh chams."] = "Công tắc tổng cho chams lưới tài nguyên.",
+    ["Max Distance"] = "Khoảng cách tối đa",
+    ["Max Distance (m)"] = "Khoảng cách tối đa (m)",
+    ["Maximum distance in studs used when searching for the next resource. Larger ranges cover more area but can produce longer direct routes."] = "Khoảng cách tối đa (studs) khi tìm tài nguyên tiếp theo. Tầm lớn bao quát hơn nhưng đường đi thẳng có thể dài hơn.",
+    ["Maximum world distance (studs) for Target Gear Overlay selection."] = "Khoảng cách tối đa trong thế giới (studs) để Bảng trang bị mục tiêu chọn.",
+    ["Medium Battery"] = "Pin vừa",
+    ["Medium Egg / Gift"] = "Trứng / Quà vừa",
+    ["Menu Overlay"] = "Nền mờ menu",
+    ["Menu Toggle Key"] = "Phím mở menu",
+    ["Mesh Chams (GPU)"] = "Chams lưới (GPU)",
+    ["Metal"] = "Kim loại",
+    ["Metal Crate"] = "Thùng kim loại",
+    ["Metal Door"] = "Cửa kim loại",
+    ["Metal Double Door"] = "Cửa đôi kim loại",
+    ["Metal Node"] = "Quặng kim loại",
+    ["Midnight Blue"] = "Xanh nửa đêm",
+    ["Military"] = "Quân đội",
+    ["Military Boat"] = "Thuyền quân đội",
+    ["Minimum delay between non-urgent comments. Death, downed, drowning, and combat can interrupt."] = "Thời gian chờ tối thiểu giữa các câu không gấp. Chết, gục, chết đuối và giao chiến có thể xen ngang.",
+    ["Misc"] = "Khác",
+    ["Mixed"] = "Pha trộn",
+    ["Mixed alternates between teasing and supportive lines; Roasty and Supportive lock the tone. Lines also roll common/uncommon/rare/mythic weights."] = "Pha trộn luân phiên giữa trêu chọc và động viên; Chọc ghẹo và Động viên cố định giọng điệu. Lời thoại cũng quay theo tỉ lệ thường/ít gặp/hiếm/huyền thoại.",
+    ["Module"] = "Mô-đun",
+    ["Motion"] = "Chuyển động",
+    ["Motion Profile"] = "Kiểu chuyển động",
+    ["Movement"] = "Di chuyển",
+    ["Movement & Utility"] = "Di chuyển & Tiện ích",
+    ["Moves faster while far away and settles softly near the target."] = "Di chuyển nhanh khi còn xa và chậm dần khi gần mục tiêu.",
+    ["Moves the announcer back to the lower-left corner."] = "Đưa nhân vật về góc dưới bên trái.",
+    ["Moves the crosshair toward your active combat target."] = "Di chuyển tâm ngắm về phía mục tiêu chiến đấu đang hoạt động.",
+    ["Moves the tactical map back to its default spot."] = "Đưa bản đồ chiến thuật về vị trí mặc định.",
+    ["Moves toward the target at a consistent smoothing rate."] = "Di chuyển tới mục tiêu với tốc độ mượt ổn định.",
+    ["NPC Box"] = "Khung NPC",
+    ["NPC Colors"] = "Màu NPC",
+    ["NPC ESP"] = "ESP NPC",
+    ["NPC Range"] = "Phạm vi NPC",
+    ["NPC Types"] = "Loại NPC",
+    ["NPCs"] = "NPC",
+    ["Name"] = "Tên",
+    ["Name used when saving. Saved as April_configs\\Name.cfg when possible, otherwise April_Config_Name.cfg in Scripts. Old slot files are imported automatically."] = "Tên dùng khi lưu. Lưu thành April_configs\\Name.cfg nếu có thể, nếu không thì April_Config_Name.cfg trong Scripts. File slot cũ được tự nhập.",
+    ["Navbar"] = "Thanh điều hướng",
+    ["Nearby Threats"] = "Mối đe dọa gần",
+    ["Neon Lime"] = "Neon chanh",
+    ["Neon: glowing beam. Laser: thin bright core. Smooth: plain line. Lightning: jagged flickering bolt. Dashed: dashed line. Pulse: a bright pulse runs along the beam."] = "Neon: tia phát sáng. Laser: lõi sáng mảnh. Mượt: đường đơn. Sét: tia giật chớp. Đứt nét: đường gạch. Nhịp: một nhịp sáng chạy dọc tia.",
+    ["Never targets your party or clan members. The same team check the player ESP uses."] = "Không bao giờ nhắm thành viên tổ đội hoặc bang của bạn. Dùng cùng kiểm tra đồng đội như ESP người chơi.",
+    ["No binds"] = "Không có phím tắt",
+    ["No matching features or modules"] = "Không có tính năng hoặc module phù hợp",
+    ["No staff detected"] = "Không phát hiện staff",
+    ["None"] = "Không",
+    ["Ocean Abyss"] = "Đại dương sâu",
+    ["Oil Barrel"] = "Thùng dầu",
+    ["Only Show Active"] = "Chỉ hiện đang hoạt động",
+    ["Only active binds"] = "Chỉ phím đang bật",
+    ["Only active events"] = "Chỉ sự kiện đang diễn ra",
+    ["Only selects targets with a clear line of sight. Turning it off allows locking through walls, but shots may still be blocked."] = "Chỉ chọn mục tiêu nhìn thấy rõ. Tắt để khóa xuyên tường, nhưng đạn vẫn có thể bị chặn.",
+    ["Only shoot when one hit would do at least this much. The estimate counts the gun's damage and range dropoff, the hit part, your attachments and the target's armor."] = "Chỉ bắn khi một phát gây ít nhất mức này. Ước tính tính sát thương súng và giảm theo tầm, bộ phận trúng, phụ tùng của bạn và giáp mục tiêu.",
+    ["Only show tracers for shots that hit a player or NPC."] = "Chỉ hiện đường đạn cho phát trúng người chơi hoặc NPC.",
+    ["Only structural pieces within this distance get wireframe chams."] = "Chỉ cấu kiện kết cấu trong khoảng cách này mới có chams lưới khung.",
+    ["Opacity"] = "Độ mờ",
+    ["Open section"] = "Mở mục",
+    ["Options"] = "Tùy chọn",
+    ["Other"] = "Khác",
+    ["Outline"] = "Viền",
+    ["Overlay Panels"] = "Bảng HUD",
+    ["Overlay Strength"] = "Độ đậm nền mờ",
+    ["Override For"] = "Ghi đè cho",
+    ["Overrides"] = "Ghi đè",
+    ["Panel Opacity %"] = "Độ mờ bảng %",
+    ["Panel and map transparency for the tactical radar overlay."] = "Độ trong suốt của bảng và bản đồ radar chiến thuật.",
+    ["Paste Color"] = "Dán màu",
+    ["Per-Element Styles"] = "Kiểu từng thành phần",
+    ["Personality"] = "Tính cách",
+    ["Phosphate"] = "Phốt phát",
+    ["Phosphate Node"] = "Quặng phốt phát",
+    ["Pick a saved/imported config. Selecting it fills Config Name."] = "Chọn cấu hình đã lưu/nhập. Chọn sẽ điền vào Tên cấu hình.",
+    ["Picks a random body part (head, torso, arms, or legs). Re-rolls every shot while Mouse 1 is held."] = "Chọn ngẫu nhiên bộ phận (đầu, thân, tay, chân). Đổi mỗi phát khi giữ chuột trái.",
+    ["Picks a random body part from head, torso, arms, and legs. Re-rolls every shot while Mouse 1 is held."] = "Chọn ngẫu nhiên bộ phận trong đầu, thân, tay, chân. Đổi mỗi phát khi giữ chuột trái.",
+    ["Pilot Pete"] = "Pilot Pete",
+    ["Player Box"] = "Khung người chơi",
+    ["Player Colors"] = "Màu người chơi",
+    ["Player ESP"] = "ESP người chơi",
+    ["Player Range"] = "Phạm vi người chơi",
+    ["Players"] = "Người chơi",
+    ["Plays a random greeting so you can test appearance and dialogue."] = "Phát lời chào ngẫu nhiên để bạn thử ngoại hình và lời thoại.",
+    ["Plays the April.lua intro whenever the script executes. Save it in your autoload profile."] = "Phát intro April.lua mỗi khi script chạy. Lưu vào cấu hình tự tải để giữ.",
+    ["Plays your own .wav files when your shot hits: one folder for headshots, one for every other hit."] = "Phát file .wav của bạn khi đạn trúng: một thư mục cho headshot, một thư mục cho các phát khác.",
+    ["Plus"] = "Dấu cộng",
+    ["Prefers the valid target closest to the center of your screen."] = "Ưu tiên mục tiêu hợp lệ gần giữa màn hình nhất.",
+    ["Prefers the valid target closest to your character in world distance."] = "Ưu tiên mục tiêu hợp lệ gần nhân vật bạn nhất.",
+    ["Preview Line"] = "Thử thoại",
+    ["Pulse"] = "Nhịp đập",
+    ["Pulse Size"] = "Cỡ nhịp",
+    ["Pulse Speed"] = "Tốc độ nhịp",
+    ["Pumpkin Plant"] = "Cây bí ngô",
+    ["Radar"] = "Radar",
+    ["Radar Base Color"] = "Màu căn cứ radar",
+    ["Radar Blip Size"] = "Cỡ chấm radar",
+    ["Radar Loot Color"] = "Màu vật phẩm radar",
+    ["Radar NPCs Color"] = "Màu NPC radar",
+    ["Radar Opacity"] = "Độ mờ radar",
+    ["Radar Players Color"] = "Màu người chơi radar",
+    ["Radar Raids Color"] = "Màu đột kích radar",
+    ["Radar Resources Color"] = "Màu tài nguyên radar",
+    ["Radar Size"] = "Cỡ radar",
+    ["Radar Zoom Level"] = "Thu phóng radar",
+    ["Raid ESP"] = "ESP đột kích",
+    ["Raid ESP Range"] = "Phạm vi ESP đột kích",
+    ["Raid Notifications"] = "Thông báo đột kích",
+    ["Raids"] = "Đột kích",
+    ["Rainbow"] = "Cầu vồng",
+    ["Rainbow Speed"] = "Tốc độ cầu vồng",
+    ["Random"] = "Ngẫu nhiên",
+    ["Random Jitter"] = "Giật ngẫu nhiên",
+    ["Randomized Part"] = "Bộ phận ngẫu nhiên",
+    ["Rapidly ducks your hitbox height."] = "Liên tục hạ thấp vùng trúng của bạn.",
+    ["Raspberry Plant"] = "Cây mâm xôi",
+    ["React To"] = "Phản ứng với",
+    ["Recoil Control"] = "Kiểm soát giật",
+    ["Red"] = "Đỏ",
+    ["Reduce Motion"] = "Giảm chuyển động",
+    ["Refresh List"] = "Làm mới danh sách",
+    ["Rejects dead or zero-health targets. Leave this on unless you specifically need stale targets."] = "Loại mục tiêu đã chết hoặc hết máu. Để bật trừ khi bạn cần mục tiêu cũ.",
+    ["Reload Game Modules"] = "Tải lại module game",
+    ["Reloads game module offsets and caches."] = "Tải lại offset và bộ nhớ đệm module game.",
+    ["Rescans saved configs and re-imports any old April_Slot files."] = "Quét lại cấu hình đã lưu và nhập lại các file April_Slot cũ.",
+    ["Reset Position"] = "Đặt lại vị trí",
+    ["Reset Radar Position"] = "Đặt lại vị trí radar",
+    ["Reset map position"] = "Đặt lại vị trí bản đồ",
+    ["Resource 3D Boxes"] = "Khung 3D tài nguyên",
+    ["Resource ESP"] = "ESP tài nguyên",
+    ["Resource Range"] = "Phạm vi tài nguyên",
+    ["Resource Show Distance"] = "Hiện khoảng cách tài nguyên",
+    ["Resource Show Name"] = "Hiện tên tài nguyên",
+    ["Resources"] = "Tài nguyên",
+    ["Resources, loot, NPCs, raids, and bases"] = "Tài nguyên, vật phẩm, NPC, đột kích và căn cứ",
+    ["Reviving"] = "Hồi sinh",
+    ["Right Arm"] = "Tay phải",
+    ["Right Leg"] = "Chân phải",
+    ["Roasty"] = "Chọc ghẹo",
+    ["Rounded"] = "Tròn",
+    ["Royal Indigo"] = "Chàm hoàng gia",
+    ["Russian"] = "Tiếng Nga",
+    ["STAFF"] = "STAFF",
+    ["STAFF IN LOBBY"] = "STAFF TRONG LOBBY",
+    ["Safe Zone"] = "Vùng an toàn",
+    ["Safezone"] = "Vùng an toàn",
+    ["Sakura Night"] = "Đêm hoa anh đào",
+    ["Salvaged Flycopter"] = "Trực thăng tận dụng",
+    ["Salvaged Metal Door"] = "Cửa kim loại tận dụng",
+    ["Save Config"] = "Lưu cấu hình",
+    ["Saved Configs"] = "Cấu hình đã lưu",
+    ["Saves current settings to April_configs as ConfigName.cfg."] = "Lưu cài đặt hiện tại vào April_configs dưới dạng ConfigName.cfg.",
+    ["Scale"] = "Kích cỡ",
+    ["Scan interval"] = "Chu kỳ quét",
+    ["Scrollbars"] = "Thanh cuộn",
+    ["Search Range"] = "Tầm tìm kiếm",
+    ["Search features, modules, settings..."] = "Tìm tính năng, module, cài đặt...",
+    ["Section Tops"] = "Đầu mục",
+    ["Select every resource type Autofarm may visit. Your held tool must support that type: axes for trees, pickaxes for nodes, or a compatible hybrid tool."] = "Chọn mọi loại tài nguyên Autofarm được phép tới. Dụng cụ đang cầm phải hỗ trợ loại đó: rìu cho cây, cuốc cho mỏ, hoặc dụng cụ lai tương thích.",
+    ["Selects the announcer. More characters can be added through the character registry."] = "Chọn nhân vật thông báo. Có thể thêm nhân vật qua danh sách nhân vật.",
+    ["Services"] = "Dịch vụ",
+    ["Setting"] = "Cài đặt",
+    ["Settings"] = "Cài đặt",
+    ["Sharp"] = "Vuông",
+    ["Shotgun Turret"] = "Trụ shotgun",
+    ["Shotgun Turret Range Ring"] = "Vòng tầm trụ shotgun",
+    ["Show Bind Mode"] = "Hiện chế độ phím",
+    ["Show Unbound"] = "Hiện phím chưa gán",
+    ["Show bind mode"] = "Hiện chế độ phím",
+    ["Show status flags (downed, SZ, staff, revive, movement, VIP, cheater, playing animation)."] = "Hiện nhãn trạng thái (gục, SZ, staff, hồi sinh, di chuyển, VIP, nghi hack, đang chơi hiệu ứng).",
+    ["Show unbound"] = "Hiện phím chưa gán",
+    ["Shows Boris boss NPCs on ESP."] = "Hiện NPC trùm Boris trên ESP.",
+    ["Shows Bruno boss NPCs on ESP."] = "Hiện NPC trùm Bruno trên ESP.",
+    ["Shows Brutus boss NPCs on ESP."] = "Hiện NPC trùm Brutus trên ESP.",
+    ["Shows Military NPCs on ESP."] = "Hiện NPC quân đội trên ESP.",
+    ["Shows Sleeper NPCs on ESP."] = "Hiện NPC người ngủ trên ESP.",
+    ["Shows Zombie NPCs on ESP."] = "Hiện NPC thây ma trên ESP.",
+    ["Shows a draggable tactical minimap overlay."] = "Hiện bản đồ nhỏ chiến thuật có thể kéo.",
+    ["Shows a draggable transparent anime announcer that reacts to local survival events. Draw-only: it creates no Roblox instances and writes nothing to Workspace."] = "Hiện nhân vật anime trong suốt có thể kéo, phản ứng với sự kiện sinh tồn của bạn. Chỉ vẽ: không tạo instance Roblox và không ghi vào Workspace.",
+    ["Shows an on-screen list of your keybinds."] = "Hiện danh sách phím tắt trên màn hình.",
+    ["Shows boxes and info on other players."] = "Hiện khung và thông tin của người chơi khác.",
+    ["Shows distance on base ESP."] = "Hiện khoảng cách trên ESP căn cứ.",
+    ["Shows distance on loot ESP."] = "Hiện khoảng cách trên ESP vật phẩm.",
+    ["Shows distance on resource ESP."] = "Hiện khoảng cách trên ESP tài nguyên.",
+    ["Shows how far away the target is."] = "Hiện khoảng cách tới mục tiêu.",
+    ["Shows live timed crates, event NPCs, and bosses. BTR tracks the 13-minute loot-fire cooldown after destroy (raids use Raid ESP only)."] = "Hiện thùng hẹn giờ, NPC sự kiện và trùm đang diễn ra. BTR theo dõi hồi 13 phút sau khi bị phá (đột kích chỉ dùng ESP đột kích).",
+    ["Shows name, health, distance, held weapon, and gear for the player closest to your crosshair."] = "Hiện tên, máu, khoảng cách, vũ khí đang cầm và trang bị của người chơi gần tâm ngắm nhất.",
+    ["Shows names on base ESP."] = "Hiện tên trên ESP căn cứ.",
+    ["Shows names on loot ESP."] = "Hiện tên trên ESP vật phẩm.",
+    ["Shows names on resource ESP."] = "Hiện tên trên ESP tài nguyên.",
+    ["Shows the Attack Heli event NPC on ESP."] = "Hiện NPC sự kiện trực thăng tấn công trên ESP.",
+    ["Shows the BTR event vehicle on ESP."] = "Hiện xe sự kiện BTR trên ESP.",
+    ["Shows the BTR event vehicle on NPC ESP."] = "Hiện xe sự kiện BTR trên ESP NPC.",
+    ["Shows the Diver Dave vendor NPC on ESP."] = "Hiện NPC bán hàng Diver Dave trên ESP.",
+    ["Shows the Pilot Pete vendor NPC on ESP."] = "Hiện NPC bán hàng Pilot Pete trên ESP.",
+    ["Shows the item a player is holding (same read path as Target Gear)."] = "Hiện vật người chơi đang cầm (cùng nguồn đọc với Trang bị mục tiêu).",
+    ["Shows the item or weapon the target currently has equipped."] = "Hiện vật phẩm hoặc vũ khí mục tiêu đang trang bị.",
+    ["Shows the player's VIP status when available."] = "Hiện trạng thái VIP của người chơi nếu có.",
+    ["Shows the staff/moderator status detected for a player."] = "Hiện trạng thái staff/moderator phát hiện được của người chơi.",
+    ["Shows the target's clan tag when available."] = "Hiện tag bang hội của mục tiêu nếu có.",
+    ["Shows the target's current health as a bar."] = "Hiện máu hiện tại của mục tiêu dưới dạng thanh.",
+    ["Shows the target's display name."] = "Hiện tên hiển thị của mục tiêu.",
+    ["Shows useful movement-state information."] = "Hiện thông tin trạng thái di chuyển hữu ích.",
+    ["Shows when a player is knocked down."] = "Hiện khi người chơi bị đánh gục.",
+    ["Shows when a player is protected by a safezone."] = "Hiện khi người chơi được vùng an toàn bảo vệ.",
+    ["Shows when a player is reviving someone."] = "Hiện khi người chơi đang hồi sinh người khác.",
+    ["Sideways Control"] = "Kiểm soát ngang",
+    ["Sideways Left"] = "Ngang trái",
+    ["Sideways Right"] = "Ngang phải",
+    ["Size"] = "Kích cỡ",
+    ["Skeleton"] = "Khung xương",
+    ["Skip Downed"] = "Bỏ qua gục ngã",
+    ["Skip Safezone"] = "Bỏ qua vùng an toàn",
+    ["Skips whitelisted players. Comma-separated Roblox user IDs below, or middle-click the current player target to toggle them."] = "Bỏ qua người chơi trong danh sách trắng. Nhập ID Roblox cách nhau bằng dấu phẩy bên dưới, hoặc nhấp chuột giữa vào mục tiêu để bật/tắt.",
+    ["Skips whitelisted players. Enter comma-separated Roblox user IDs below, or middle-click the current player target to toggle them."] = "Bỏ qua người chơi trong danh sách trắng. Nhập ID Roblox cách nhau bằng dấu phẩy bên dưới, hoặc nhấp chuột giữa vào mục tiêu để bật/tắt.",
+    ["Sleeper"] = "Người ngủ",
+    ["Sleepers"] = "Người ngủ",
+    ["Sleeping Bag"] = "Túi ngủ",
+    ["Sliders"] = "Thanh trượt",
+    ["Small Battery"] = "Pin nhỏ",
+    ["Small Egg / Gift"] = "Trứng / Quà nhỏ",
+    ["Small Storage Box"] = "Hộp chứa nhỏ",
+    ["Smooth Type"] = "Kiểu mượt",
+    ["Smooth camera aim assist on your current target. Bind a key on the chip (Always / Hold / Toggle)."] = "Hỗ trợ ngắm mượt bằng camera vào mục tiêu hiện tại. Gán phím trên ô (Luôn bật / Giữ / Bật-tắt).",
+    ["Smoothly grows and shrinks the visual."] = "Phóng to thu nhỏ hiệu ứng một cách mượt mà.",
+    ["Smoothness"] = "Độ mượt",
+    ["Snow"] = "Tuyết",
+    ["Soft"] = "Mềm",
+    ["Soft falling snow behind the menu. Hidden when Reduce Motion is on."] = "Tuyết rơi nhẹ phía sau menu. Ẩn khi bật Giảm chuyển động.",
+    ["Solar Panel"] = "Tấm pin mặt trời",
+    ["Spam Height"] = "Độ cao spam",
+    ["Spam Interval (ms)"] = "Chu kỳ spam (ms)",
+    ["Spam Max"] = "Spam tối đa",
+    ["Spam Min"] = "Spam tối thiểu",
+    ["Spam Mode"] = "Chế độ spam",
+    ["Speed"] = "Tốc độ",
+    ["Spin"] = "Xoay",
+    ["Spin Speed"] = "Tốc độ xoay",
+    ["Spoofs your look direction to other players."] = "Giả hướng nhìn của bạn với người chơi khác.",
+    ["Staff"] = "Staff",
+    ["Staff In Lobby"] = "Staff trong lobby",
+    ["Startup Animation"] = "Hiệu ứng khởi động",
+    ["Static"] = "Tĩnh",
+    ["Stay Visible"] = "Luôn hiển thị",
+    ["Steel Crate"] = "Thùng thép",
+    ["Steel Door"] = "Cửa thép",
+    ["Steel Double Door"] = "Cửa đôi thép",
+    ["Sticky Aim"] = "Bám dính",
+    ["Sticky Target"] = "Mục tiêu bám dính",
+    ["Stone"] = "Đá",
+    ["Stone Node"] = "Mỏ đá",
+    ["Storage Cabinet"] = "Tủ chứa",
+    ["Strength %"] = "Độ mạnh %",
+    ["Style"] = "Kiểu",
+    ["Subtle"] = "Nhẹ nhàng",
+    ["Supportive"] = "Động viên",
+    ["Survival Needs"] = "Nhu cầu sinh tồn",
+    ["Switch the April interface and HUD text to the selected language."] = "Chuyển toàn bộ giao diện April và chữ HUD sang ngôn ngữ đã chọn.",
+    ["Switches"] = "Nút gạt",
+    ["Switches the entire April menu and HUD text to Russian (Latin spelling — Vector's font cannot draw Cyrillic)."] = "Chuyển toàn bộ menu April và chữ HUD sang tiếng Nga (phiên âm Latin vì phông của Vector không vẽ được chữ Kirin).",
+    ["T-Shape"] = "Chữ T",
+    ["TARGET LOADOUT"] = "TRANG BỊ MỤC TIÊU",
+    ["Tab"] = "Tab",
+    ["Tab autocomplete   Up/Down navigate   Enter open   Esc close"] = "Tab gợi ý   Up/Down chọn   Enter mở   Esc đóng",
+    ["Tactical Map"] = "Bản đồ chiến thuật",
+    ["Target From"] = "Chọn mục tiêu từ",
+    ["Target Gear"] = "Trang bị mục tiêu",
+    ["Target Gear Overlay"] = "Bảng trang bị mục tiêu",
+    ["Target Line"] = "Đường mục tiêu",
+    ["Target Type"] = "Loại mục tiêu",
+    ["Targeting"] = "Ngắm bắn",
+    ["Targets other players that pass the selected Filters."] = "Nhắm người chơi khác vượt qua bộ lọc đã chọn.",
+    ["Targets standard Military NPCs."] = "Nhắm NPC quân đội thường.",
+    ["Targets the Attack Helicopter NPC."] = "Nhắm NPC trực thăng tấn công.",
+    ["Targets the BTR armored vehicle NPC."] = "Nhắm NPC xe bọc thép BTR.",
+    ["Targets the Boris boss NPC."] = "Nhắm NPC trùm Boris.",
+    ["Targets the Bruno boss NPC."] = "Nhắm NPC trùm Bruno.",
+    ["Targets the Brutus boss NPC."] = "Nhắm NPC trùm Brutus.",
+    ["Targets the Diver Dave NPC."] = "Nhắm NPC Diver Dave.",
+    ["Targets the Pilot Pete NPC."] = "Nhắm NPC Pilot Pete.",
+    ["Targets the Sleeper NPC."] = "Nhắm NPC người ngủ.",
+    ["Targets the Zombie NPC."] = "Nhắm NPC thây ma.",
+    ["Team Check"] = "Kiểm tra đồng đội",
+    ["Theme Preset"] = "Bộ giao diện",
+    ["Thickness"] = "Độ dày",
+    ["Timed Crate"] = "Thùng hẹn giờ",
+    ["Title Bar"] = "Thanh tiêu đề",
+    ["Tieng Viet"] = "Tiếng Việt",
+    ["Toast when a raid explosion is detected."] = "Báo khi phát hiện vụ nổ đột kích.",
+    ["Toggle"] = "Bật/tắt",
+    ["Tomato Plant"] = "Cây cà chua",
+    ["Top Offset"] = "Lệch trên",
+    ["Torso"] = "Thân",
+    ["Trap Door"] = "Cửa sập",
+    ["Trash Can"] = "Thùng rác",
+    ["Trees"] = "Cây",
+    ["Triangle Trap Door"] = "Cửa sập tam giác",
+    ["Type to search every feature and module"] = "Gõ để tìm mọi tính năng và module",
+    ["UI Scale %"] = "Tỉ lệ giao diện %",
+    ["Under the crosshair: the target, the hit part and the estimated damage, plus MIN DMG OVERRIDE while the override is on."] = "Dưới tâm ngắm: mục tiêu, bộ phận trúng và sát thương ước tính, kèm MIN DMG OVERRIDE khi bật ghi đè.",
+    ["Untick a part to never aim at it (Closest and Random). Every part is checked on its own: a hidden one is skipped for a part in plain sight."] = "Bỏ chọn một bộ phận để không bao giờ ngắm vào đó (Gần nhất và Ngẫu nhiên). Mỗi bộ phận được kiểm tra riêng: bộ phận bị che sẽ được thay bằng bộ phận nhìn thấy rõ.",
+    ["Untick a part to never aim at it (Closest and Random). In Random its share goes to the parts left ticked."] = "Bỏ chọn một bộ phận để không bao giờ ngắm vào đó (Gần nhất và Ngẫu nhiên). Ở Ngẫu nhiên, phần tỉ lệ của nó chia cho các bộ phận còn chọn.",
+    ["Uses a gradual acceleration and deceleration curve."] = "Dùng đường cong tăng tốc và giảm tốc dần.",
+    ["Uses an exponential curve for a responsive but smooth correction."] = "Dùng đường cong lũy thừa để chỉnh nhanh mà vẫn mượt.",
+    ["Uses the first enabled combat system with a valid target."] = "Dùng hệ thống chiến đấu bật đầu tiên có mục tiêu hợp lệ.",
+    ["Uses the same team check as the ESP."] = "Dùng cùng kiểm tra đồng đội như ESP.",
+    ["Utility"] = "Tiện ích",
+    ["VIP"] = "VIP",
+    ["VectorChan"] = "VectorChan",
+    ["Violet Glass"] = "Kính tím",
+    ["Visible Layers"] = "Lớp hiển thị",
+    ["Visible Only"] = "Chỉ thấy rõ",
+    ["Visuals"] = "Hiển thị",
+    ["Waits until the player's health drops before playing, so misses and blocked shots stay silent. NPCs play right away."] = "Chờ tới khi máu người chơi giảm mới phát, nên phát trượt và phát bị chặn im lặng. NPC phát ngay.",
+    ["Wave"] = "Gợn sóng",
+    ["When Auto Fire keeps clicking and no bullet comes out, the magazine is empty: it presses R once and waits for the reload. Starts working once your gun has fired since you equipped it."] = "Khi Tự động bắn vẫn nhấp mà không ra đạn, băng đã hết: nó nhấn R một lần và chờ nạp. Bắt đầu hoạt động sau khi súng đã bắn ít nhất một phát kể từ lúc trang bị.",
+    ["Which body part the aimbot tracks. Randomized Part re-rolls every shot while holding Mouse 1."] = "Bộ phận cơ thể Aimbot bám theo. Bộ phận ngẫu nhiên đổi mỗi phát khi giữ chuột trái.",
+    ["Which events can trigger dialogue: survival, combat, nearby threats (300 studs), and world events."] = "Sự kiện nào kích hoạt lời thoại: sinh tồn, chiến đấu, mối đe dọa gần (300 studs) và sự kiện thế giới.",
+    ["While active, Min Damage is replaced by Override Damage. Bind a key; it is a Hold key by default."] = "Khi hoạt động, Sát thương tối thiểu được thay bằng Sát thương ghi đè. Gán phím; mặc định là phím Giữ.",
+    ["While you fire a gun, cancels recoil only. Your own mouse movement always goes through, so you can aim freely. Camera only, no GC."] = "Khi bắn súng, chỉ triệt giật. Di chuột của bạn luôn được giữ nguyên nên vẫn ngắm tự do. Chỉ camera, không GC.",
+    ["While your aim key is held, stays on the first target even if they leave FOV. Releases and forgets the target when you let go of the bind."] = "Khi giữ phím ngắm, vẫn bám mục tiêu đầu tiên dù nó ra khỏi FOV. Thả phím là nhả và quên mục tiêu.",
+    ["Whitelist"] = "Danh sách trắng",
+    ["Whitelist IDs"] = "ID danh sách trắng",
+    ["Wild Boar"] = "Lợn rừng hoang",
+    ["Windmill"] = "Cối xay gió",
+    ["Window Opacity %"] = "Độ mờ cửa sổ %",
+    ["Wireframe"] = "Khung lưới",
+    ["Wireframe Glow"] = "Khung lưới phát sáng",
+    ["Wireframe mesh chams on structural walls/floors/foundations (Detail meshes). ApplyChams only — no Material/Texture/Transparency writes, no new instances. Skips Base ESP targets (doors, boxes, turrets, cabinets)."] = "Chams lưới khung trên tường/sàn/móng kết cấu (mesh chi tiết). Chỉ ApplyChams — không ghi Material/Texture/Transparency, không tạo instance mới. Bỏ qua mục tiêu ESP căn cứ (cửa, hộp, trụ, tủ).",
+    ["Wolf"] = "Sói",
+    ["Wooden Boat"] = "Thuyền gỗ",
+    ["Wooden Crate"] = "Thùng gỗ",
+    ["Wooden Door"] = "Cửa gỗ",
+    ["Wooden Double Door"] = "Cửa đôi gỗ",
+    ["Wool Plant"] = "Cây bông",
+    ["World"] = "Thế giới",
+    ["World Events"] = "Sự kiện thế giới",
+    ["X"] = "X",
+    ["Xray Range"] = "Phạm vi xuyên",
+    ["Yaw Mode"] = "Chế độ xoay",
+    ["Yellow"] = "Vàng",
+    ["Zombie"] = "Thây ma",
+    ["Active First"] = "Đang hoạt động trước",
+    ["Aim Key (hold)"] = "Phím ngắm (giữ)",
+    ["Aim Point"] = "Điểm ngắm",
+    ["Aimbot Indicators"] = "Chỉ báo Aimbot",
+    ["Anti AFK"] = "Chống AFK",
+    ["Anti Fling"] = "Chống hất văng",
+    ["Arm Chams"] = "Chams tay",
+    ["Attack Heli Aimbot"] = "Aimbot trực thăng",
+    ["Audio Radar"] = "Radar âm thanh",
+    ["Auto (Best Weak Point)"] = "Tự động (điểm yếu nhất)",
+    ["Auto Fire"] = "Tự động bắn",
+    ["Automatic Weapon Calculation Indicator"] = "Chỉ báo tự tính súng",
+    ["Automatic Weapon Stats"] = "Thông số súng tự động",
+    ["Body"] = "Thân",
+    ["Bullet Drop Compensation"] = "Bù độ rơi đạn",
+    ["Bullet Drop Indicator"] = "Chỉ báo độ rơi đạn",
+    ["Bullet Drop Prediction"] = "Dự đoán độ rơi đạn",
+    ["Bullet Gravity"] = "Trọng lực đạn",
+    ["Bullet Speed"] = "Tốc độ đạn",
+    ["Bullet Tracers"] = "Vệt đạn",
+    ["Bunny Hop"] = "Nhảy liên tục",
+    ["Camera"] = "Camera",
+    ["Category Colors"] = "Màu theo loại",
+    ["Chams"] = "Chams",
+    ["Chams Type"] = "Loại chams",
+    ["Combat Mode"] = "Chế độ chiến đấu",
+    ["Dashed"] = "Đứt nét",
+    ["Display Time (s)"] = "Thời gian hiện (s)",
+    ["Enable Heli Aimbot"] = "Bật Aimbot trực thăng",
+    ["Enable Mesh Chams"] = "Bật chams lưới",
+    ["Enable Silent Aim"] = "Bật Silent Aim",
+    ["Engine (like ahook)"] = "Engine (như ahook)",
+    ["Event Notifications"] = "Thông báo sự kiện",
+    ["Event Sorting"] = "Sắp xếp sự kiện",
+    ["FOV Radius"] = "Bán kính FOV",
+    ["Fade Out"] = "Mờ dần",
+    ["Fill FOV"] = "Tô đầy FOV",
+    ["Filled"] = "Đặc",
+    ["Footsteps"] = "Tiếng bước chân",
+    ["Game Order"] = "Thứ tự game",
+    ["Glow"] = "Phát sáng",
+    ["Gun"] = "Súng",
+    ["Headshot Sound"] = "Âm headshot",
+    ["Hit Color"] = "Màu trúng đạn",
+    ["Hit Part"] = "Bộ phận trúng",
+    ["Hit Parts"] = "Bộ phận trúng",
+    ["Hit Sound"] = "Âm trúng đạn",
+    ["Hitsounds"] = "Âm thanh trúng đạn",
+    ["Impact Marker"] = "Đánh dấu điểm chạm",
+    ["Impact Size"] = "Cỡ điểm chạm",
+    ["Invisible Arms"] = "Ẩn tay",
+    ["Laser"] = "Laser",
+    ["Latency Compensation (ms)"] = "Bù độ trễ (ms)",
+    ["Lightning"] = "Sét",
+    ["Lower Torso"] = "Thân dưới",
+    ["LowerTorso"] = "Thân dưới",
+    ["Magic Bullet"] = "Magic Bullet",
+    ["Main Rotor"] = "Cánh quạt chính",
+    ["Manual Bullet Speed"] = "Tốc độ đạn thủ công",
+    ["Manual Gravity"] = "Trọng lực thủ công",
+    ["Material"] = "Chất liệu",
+    ["Max Per Player"] = "Tối đa mỗi người",
+    ["Max Tracers"] = "Tối đa vệt đạn",
+    ["Min Damage"] = "Sát thương tối thiểu",
+    ["Min Damage Override"] = "Ghi đè sát thương tối thiểu",
+    ["Movement Prediction"] = "Dự đoán di chuyển",
+    ["NPC Hits"] = "Trúng NPC",
+    ["NPC Key Mode"] = "Chế độ phím NPC",
+    ["NPCs Key"] = "Phím NPC",
+    ["Nearest First"] = "Gần nhất trước",
+    ["Neon"] = "Neon",
+    ["Offscreen Arrows"] = "Mũi tên ngoài màn hình",
+    ["Only Hit Tracers"] = "Chỉ vệt đạn trúng",
+    ["Only Show Active Events"] = "Chỉ hiện sự kiện đang diễn ra",
+    ["Only When Damage Lands"] = "Chỉ khi gây sát thương",
+    ["Overlay"] = "Lớp phủ",
+    ["Overlay Style"] = "Kiểu lớp phủ",
+    ["Override Damage"] = "Sát thương ghi đè",
+    ["Player Key Mode"] = "Chế độ phím người chơi",
+    ["Players Key"] = "Phím người chơi",
+    ["Prediction Debug Overlay"] = "Lớp gỡ lỗi dự đoán",
+    ["Protection & Access"] = "Bảo vệ & truy cập",
+    ["RAGE"] = "RAGE",
+    ["Radar Detail"] = "Chi tiết radar",
+    ["Radar Filters"] = "Bộ lọc radar",
+    ["Ragebot"] = "Ragebot",
+    ["Ragebot Targeting"] = "Ngắm Ragebot",
+    ["Refresh Sound List"] = "Làm mới danh sách âm",
+    ["Reload When Empty"] = "Tự nạp khi hết đạn",
+    ["Ring"] = "Vòng",
+    ["Screen Offset"] = "Lệch màn hình",
+    ["Shot Mode"] = "Kiểu bắn",
+    ["Show Event Distance"] = "Hiện khoảng cách sự kiện",
+    ["Show Event Health"] = "Hiện máu sự kiện",
+    ["Show FOV Circle"] = "Hiện vòng FOV",
+    ["Show Target Info"] = "Hiện thông tin mục tiêu",
+    ["Silent Aim"] = "Silent Aim",
+    ["Skip Teammates"] = "Bỏ qua đồng đội",
+    ["Smooth"] = "Mượt",
+    ["Smoothing"] = "Độ mượt",
+    ["Sound Chip"] = "Ô âm thanh",
+    ["Sound Color"] = "Màu âm thanh",
+    ["Sound ESP"] = "ESP âm thanh",
+    ["Sound Fade In"] = "Hiện dần âm thanh",
+    ["Sound Fade Out"] = "Mờ dần âm thanh",
+    ["Sound Range"] = "Phạm vi âm thanh",
+    ["Sound Text Size"] = "Cỡ chữ âm thanh",
+    ["Start From"] = "Bắt đầu từ",
+    ["Tail Rotor"] = "Cánh quạt đuôi",
+    ["Target Bone"] = "Xương mục tiêu",
+    ["Target NPCs"] = "Nhắm NPC",
+    ["Target NPCs (Military, Bosses, Zombies)"] = "Nhắm NPC (quân đội, trùm, thây ma)",
+    ["Target Players"] = "Nhắm người chơi",
+    ["Target Priority"] = "Ưu tiên mục tiêu",
+    ["Test Headshot Sound"] = "Thử âm headshot",
+    ["Test Hit Sound"] = "Thử âm trúng đạn",
+    ["Tracers"] = "Vệt đạn",
+    ["Try Other Parts"] = "Thử bộ phận khác",
+    ["Turn Prediction"] = "Dự đoán xoay",
+    ["Under Offset"] = "Lệch dưới",
+    ["Upper Torso"] = "Thân trên",
+    ["UpperTorso"] = "Thân trên",
+    ["Velocity Prediction"] = "Dự đoán vận tốc",
+    ["Velocity Prediction Indicator"] = "Chỉ báo dự đoán vận tốc",
+}
+for en, tr in pairs(STRINGS_VI) do
+    STRINGS_VI[en] = strip_vi(tr)
+end
+local STRINGS_VI_LOWER = {}
+for en, tr in pairs(STRINGS_VI) do
+    local lowered = string.lower(en)
+    if STRINGS_VI_LOWER[lowered] == nil then
+        STRINGS_VI_LOWER[lowered] = tr
+    end
+end
 local _last_check = nil
-local _cached_ru = false
+local _cached_lang = 0
 local function as_bool(v)
     if v == true or v == 1 or v == "1" or v == "true" or v == "True" then
         return true
     end
     return false
 end
-local function read_lang()
+local function as_lang(v)
+    local n = tonumber(v)
+    if n == nil then return nil end
+    n = math.floor(n)
+    if n <= 0 then return 0 end
+    if n >= 2 then return 2 end
+    return n
+end
+local function read_setting(id)
     local ok, gs = pcall(function()
         return April.require("ui.gs_state")
     end)
-    if ok and type(gs) == "table" then
-        if type(gs.bool) == "function" then
-            local v = gs.bool(M.LANG_ID, false)
-            if v ~= nil then return as_bool(v) end
-        end
-        if type(gs.get) == "function" then
-            local v = gs.get(M.LANG_ID, nil)
-            if v ~= nil then return as_bool(v) end
-        end
+    if ok and type(gs) == "table" and type(gs.get) == "function" then
+        local v = gs.get(id, nil)
+        if v ~= nil then return v end
     end
     local ok2, settings = pcall(function()
         return April.require("core.settings")
     end)
-    if ok2 and type(settings) == "table" and type(settings.bool) == "function" then
-        return settings.bool(M.LANG_ID, false) == true
+    if ok2 and type(settings) == "table" and type(settings.get) == "function" then
+        local v = settings.get(id, nil)
+        if v ~= nil then return v end
     end
     if menu and type(menu.get) == "function" then
-        local v = menu.get(M.LANG_ID)
-        if v ~= nil then return as_bool(v) end
+        local ok3, v = pcall(menu.get, id)
+        if ok3 and v ~= nil then return v end
     end
-    return false
+    return nil
 end
-function M.is_ru()
+local function write_lang(v)
+    pcall(function()
+        local gs = April.require("ui.gs_state")
+        if type(gs) == "table" and type(gs.set) == "function" then
+            gs.set(M.LANG_ID, v)
+        end
+    end)
+end
+local function read_lang()
+    local lang = as_lang(read_setting(M.LANG_ID))
+    if lang ~= nil and lang ~= 0 then
+        return lang
+    end
+    if as_bool(read_setting(M.LEGACY_ID)) then
+        -- configs saved before the language selector only had the Russian checkbox
+        write_lang(1)
+        return 1
+    end
+    return 0
+end
+local function lang_name(n)
+    if n == 1 then return "ru" end
+    if n == 2 then return "vi" end
+    return "en"
+end
+function M.lang()
     local tick = nil
     if utility and utility.get_tick_count then
         tick = utility.get_tick_count()
     end
     if tick ~= nil and tick == _last_check then
-        return _cached_ru
+        return lang_name(_cached_lang)
     end
     _last_check = tick
-    _cached_ru = read_lang()
-    return _cached_ru
+    _cached_lang = read_lang()
+    return lang_name(_cached_lang)
+end
+function M.is_ru()
+    return M.lang() == "ru"
+end
+function M.is_vi()
+    return M.lang() == "vi"
+end
+local function translate_vi(key)
+    local hit = STRINGS_VI[key]
+    if hit then return hit end
+    hit = STRINGS_VI_LOWER[string.lower(key)]
+    if hit then return hit end
+    local label, scope = key:match("^Highlights (.+) on ([%w ]+) ESP%.$")
+    if label then
+        local scope_vi = ({ resource = "ESP tài nguyên", loot = "ESP vật phẩm", base = "ESP căn cứ" })[scope]
+        if scope_vi then
+            return strip_vi("Làm nổi bật " .. (STRINGS_VI[label] or label) .. " trên " .. scope_vi .. ".")
+        end
+    end
+    label = key:match("^Shows a range ring around nearby (.+)%.$")
+    if label then
+        return strip_vi("Hiển thị vòng phạm vi quanh các " .. (STRINGS_VI[label] or label) .. " ở gần.")
+    end
+    label = key:match("^Toggle (.+)%.$")
+    if label then
+        return strip_vi("Bật/tắt " .. (STRINGS_VI_LOWER[string.lower(label)] or label) .. ".")
+    end
+    label = key:match("^Enables (.+)%.$")
+    if label then
+        return strip_vi("Bật " .. (STRINGS_VI_LOWER[string.lower(label)] or label) .. ".")
+    end
+    label = key:match("^Keybind for (.+)%.$")
+    if label then
+        return strip_vi("Gán phím cho " .. (STRINGS_VI_LOWER[string.lower(label)] or label) .. ".")
+    end
+    local suffix = " Range Ring"
+    if #key > #suffix and key:sub(-#suffix) == suffix then
+        local base = key:sub(1, #key - #suffix)
+        return strip_vi("Vòng tầm " .. (STRINGS_VI[base] or STRINGS_VI_LOWER[string.lower(base)] or base))
+    end
+    if key:sub(-1) == "." then
+        local base = key:sub(1, -2)
+        local base_vi = STRINGS_VI[base] or STRINGS_VI_LOWER[string.lower(base)]
+        if base_vi then return base_vi .. "." end
+    end
+    return key
 end
 function M.t(text)
     if text == nil or text == "" then return text end
-    if not M.is_ru() then return text end
+    local lang = M.lang()
+    if lang == "en" then return text end
     local key = tostring(text)
+    if lang == "vi" then
+        return translate_vi(key)
+    end
     local hit = STRINGS[key]
     if hit then return hit end
     local suffix = " Range Ring"
@@ -26640,8 +26756,12 @@ function M.tip(id, text)
     return text
 end
 function M.modes()
-    if M.is_ru() then
+    local lang = M.lang()
+    if lang == "ru" then
         return { "Vsegda", "Uderzhanie", "Pereklyuchenie" }
+    end
+    if lang == "vi" then
+        return { "Luon bat", "Giu", "Bat/tat" }
     end
     return { "Always", "Hold", "Toggle" }
 end
@@ -26666,7 +26786,6 @@ M.SKIP_IDS = {
 april_aim_draw_fov = true,
 april_aim_fov_style = true,
 april_aim_target_line = true,
-april_desync_visualizer = true,
 april_keybinds_active_only = true,
 april_keybinds_show_unbound = true,
 april_keybinds_show_mode = true,
@@ -26678,7 +26797,6 @@ april_ui_menu_fade = true,
 april_ui_per_element = true,
 april_ui_menu_overlay = true,
 april_ui_snow = true,
-april_fakeduck_spam = true,
 }
 M.BY_ID = {
 april_aimbot = "Smooth camera aim assist on your current target. Bind a key on the chip (Always / Hold / Toggle).",
@@ -26706,8 +26824,6 @@ april_player_flag_animation = "Color for the Animation ESP side flag ([RELOAD], 
 april_target_overlay = "Shows name, health, distance, held weapon, and gear for the player closest to your crosshair.",
 april_target_overlay_fov = "Independent FOV (pixels from crosshair) used only by Target Gear Overlay.",
 april_target_overlay_max_dist = "Maximum world distance (studs) for Target Gear Overlay selection.",
-april_crosshair_enabled = "Draws a custom crosshair on screen.",
-april_crosshair_follow = "Moves the crosshair toward your active combat target.",
 april_ui_crosshair_motion = "Adds spin or pulse animation to the crosshair.",
 april_ui_crosshair_options = "Extra crosshair drawing options.",
 april_world_enabled = "Highlights harvestable resources and animals in the world.",
@@ -26740,10 +26856,6 @@ april_npc_sleeper = "Shows Sleeper NPCs on ESP.",
 april_npc_zombie = "Shows Zombie NPCs on ESP.",
 april_npc_tracers = "Draws tracers to tracked NPCs while NPC ESP is on.",
 april_npc_offscreen = "Draws off-screen arrows pointing to NPCs outside the view.",
-april_desync_enabled = "Desyncs your network position from where you appear.",
-april_antiaim_enabled = "Spoofs your look direction to other players.",
-april_fakeduck_enabled = "Rapidly ducks your hitbox height.",
-april_fling_enabled = "Launches nearby entities upward.",
 april_autofarm = "Automatically turns and runs to selected resources, verifies the live weak point is visible and centered, then swings using the equipped compatible tool. Vector must be the foreground window because movement and clicks use OS input.",
 april_autofarm_resources = "Select every resource type Autofarm may visit. Your held tool must support that type: axes for trees, pickaxes for nodes, or a compatible hybrid tool.",
 april_autofarm_search_range = "Maximum distance in studs used when searching for the next resource. Larger ranges cover more area but can produce longer direct routes.",
@@ -26845,10 +26957,6 @@ april_aim_bone = HITBOX_TIPS,
 april_aim_targets = TARGET_TIPS,
 april_aim_filters = FILTER_TIPS,
 april_aim_smooth_type = SMOOTH_TIPS,
-april_crosshair_source = {
-"Uses the first enabled combat system with a valid target.",
-"Follows the regular camera Aimbot's current target.",
-},
 april_autofarm_resources = {
 "Allows Autofarm to harvest tree models. Equip an axe, hatchet, chainsaw, or compatible hybrid tool.",
 "Allows Autofarm to mine Stone_Node models. Equip a pickaxe, mining drill, or compatible hybrid tool.",
@@ -26940,6 +27048,19 @@ tip = fallback_tip(item)
 end
 if not tip then return nil end
 local i18n = April.require("ui.i18n")
+if i18n.is_vi() then
+tip = i18n.tip(item.id, tip)
+if item.type == "keybind" then
+return tip .. " Nhap trai vao o phim de gan (chuot trai dung duoc sau khi tha); nhap phai de chon Luon bat, Giu hoac Bat/tat. Che do Giu cung can bat cong tac tinh nang. Escape, Backspace hoac Delete de xoa phim."
+end
+if item.type == "aim_key" then
+return tip .. " Nhap trai vao o phim de gan (chuot trai dung duoc sau khi tha); nhap phai de chon Luon bat, Giu hoac Bat/tat. Escape, Backspace hoac Delete de xoa phim."
+end
+if item.type == "hotkey" then
+return tip .. " Nhap trai vao o phim de gan (chuot trai dung duoc sau khi tha). Escape, Backspace hoac Delete de xoa phim."
+end
+return tip
+end
 if i18n.is_ru() then
 tip = i18n.tip(item.id, tip)
 if item.type == "keybind" then
@@ -26972,10 +27093,7 @@ tip = M.OPTION_BY_LABEL[tostring(label or "")]
 end
 if not tip then return tip end
 local i18n = April.require("ui.i18n")
-if i18n.is_ru() then
 return i18n.t(tip)
-end
-return tip
 end
 return M
 end)()
@@ -27298,6 +27416,7 @@ local input = April.require("ui.gs_input")
 local state = April.require("ui.gs_state")
 local anim = April.require("ui.gs_anim")
 local tooltips = April.require("ui.tooltips")
+local clipboard = April.require("core.clipboard")
 local M = {}
 M.active_slider = nil
 M.active_slider_input = nil
@@ -27370,10 +27489,12 @@ return #(tostring(str or "")) * 7
 end
 local function fit_text(str, max_w, size)
 str = tostring(str or "")
-if max_w <= 0 or text_w(str, size) <= max_w then return str end
+if max_w <= 0 then return "" end
+if text_w(str, size) <= max_w then return str end
 local suffix = "..."
+if text_w(suffix, size) > max_w then return "" end
 while #str > 0 and text_w(str .. suffix, size) > max_w do
-str = str:sub(1, -2)
+str = str:gsub("[^\128-\191][\128-\191]*$", "")
 end
 return str .. suffix
 end
@@ -27658,7 +27779,7 @@ local function wrap_tip_lines(text, max_w, fs)
 text = tostring(text or "")
 local lines = {}
 local line = ""
-for word in text:gmatch("%S+") do
+for word in text:gmatch("[^ \t\r\n]+") do
 local test = line == "" and word or (line .. " " .. word)
 if text_w(test, fs) > max_w and line ~= "" then
 lines[#lines + 1] = line
@@ -27978,11 +28099,19 @@ elseif not filled and outline then
 outline(x, y, w, h, col, rounding or 0, 1)
 end
 end
-function M.text(x, y, str, col, size)
+function M.text(x, y, str, col, size, max_w)
 local fn = draw and (draw.text or draw.Text)
-if fn then
-fn(x, y, tostring(str), col, size or theme.FONT)
+if not fn then return end
+size = size or theme.FONT
+str = tostring(str)
+local c = M.clip
+if c then
+if x < c.x or x >= c.x + c.w or not in_clip(y, size) then return end
+local remaining = c.x + c.w - x
+max_w = math.min(max_w or remaining, remaining)
 end
+if max_w then str = fit_text(str, max_w, size) end
+if str ~= "" then fn(x, y, str, col, size) end
 end
 function M.rainbow_bar(x, y, w, h)
 anim.draw_title_bar(x, y, w, h)
@@ -28287,9 +28416,17 @@ end
 end
 function M.tick_text_input()
 if not M.active_input or M.listening_key then return end
-if input.key_down(0x11) or input.key_down(0x12) then return end
 local id = M.active_input
 local val = tostring(state.get(id, ""))
+if input.key_down(0x11) and input.key_pressed(0x56) then
+local text = clipboard.read()
+if type(text) == "string" and text ~= "" then
+state.set(id, val .. (text:gsub("[\r\n\t]+", " ")))
+end
+M._input_repeat_vk = nil
+return
+end
+if input.key_down(0x11) or input.key_down(0x12) then return end
 if input.key_pressed(0x1B) or input.key_pressed(0x0D) then
 M.active_input = nil
 M._input_repeat_vk = nil
@@ -28653,7 +28790,7 @@ end
 function M.label(x, y, w, text, dim)
 local h = theme.ROW_H - 4
 if not in_clip(y, h) then return h end
-M.text(x + 4, y + 3, text, dim and theme.TEXT_DIM or theme.TEXT_TITLE, theme.FONT_SMALL)
+M.text(x + 4, y + 3, text, dim and theme.TEXT_DIM or theme.TEXT_TITLE, theme.FONT_SMALL, w - 8)
 return h
 end
 function M.separator(x, y, w)
@@ -28873,6 +29010,13 @@ local text_y = y + math.floor((h - theme.FONT_SMALL) * 0.5) - 1
 if shown == "" then
 M.text(text_x, text_y, placeholder or "...", theme.TEXT_DIM, theme.FONT_SMALL)
 else
+if #shown > 256 then
+shown = shown:sub(-256)
+while #shown > 0 do
+local b = shown:byte(1)
+if b >= 0x80 and b < 0xC0 then shown = shown:sub(2) else break end
+end
+end
 while #shown > 0 and text_w(shown, theme.FONT_SMALL) > max_w do
 shown = shown:sub(2)
 end
@@ -29089,45 +29233,80 @@ end)()
 
 April._mods["ui.catalog_aim"] = (function()
 local I = April.require("ui.catalog_items")
-local combat_menu = April.require("ui.combat_labels")
-local cb, kb, sl, combo, multi, btn, sep, color, input, ak =
-I.cb, I.kb, I.sl, I.combo, I.multi, I.btn, I.sep, I.color, I.input, I.ak
+local cb, kb, sl, combo, hk, sep, input, btn = I.cb, I.kb, I.sl, I.combo, I.hk, I.sep, I.input, I.btn
 local M = {}
 function M.build()
-local regular = {
+local G = "april_aimbot_enabled"
+local aimbot = {
 title = "Aimbot",
-master = "april_aimbot",
 items = {
-kb("april_aimbot", "Enable Aimbot", false, nil, { hide_color = true }),
-ak("april_aim_key", "Aim Key"),
-sep(),
-I.label("Targeting", true),
-combo("april_aim_target_type", "Target Type", { "Crosshair", "Distance" }, 0),
-combo("april_aim_bone", "Hitbox", combat_menu.SILENT_BONES, 0),
-multi("april_aim_targets", "Aim At", combat_menu.AIM_AT_OPTIONS, combat_menu.AIM_AT_DEFAULTS),
-multi("april_aim_filters", "Filters", {
-"Health Check", "Visible Only", "Team Check",
-"Skip Safezone", "Whitelist", "Skip Downed",
-}, { true, false, true, true, false, true }),
-input("april_aim_whitelist_ids", "Whitelist IDs", ""),
-btn("april_aim_whitelist_clear", "Clear Whitelist"),
-sl("april_aim_max_dist", "Max Distance (m)", 50, 2000, 500),
-sep(),
-I.label("Behavior", true),
-cb("april_aim_sticky", "Sticky Aim", false),
-cb("april_aim_auto_pred", "Auto Prediction", true),
-sl("april_aim_smooth", "Smoothness", 1, 25, 10),
-combo("april_aim_smooth_type", "Smooth Type", {
-"Linear", "Ease Out", "Ease In-Out", "Exponential", "Adaptive",
-}, 0),
-cb("april_aim_humanize", "Humanize", false),
-sl("april_aim_humanize_str", "Humanize Strength", 1, 100, 35, false, "april_aim_humanize"),
-sl("april_aim_fov", "FOV Radius (px)", 5, 600, 120),
-sep(),
-I.label("Feedback", true),
-cb("april_aim_draw_fov", "FOV Circle", false, { 0.2, 1, 0.45, 1 }),
-combo("april_aim_fov_style", "FOV Style", { "Outline", "Filled Circle" }, 1, "april_aim_draw_fov"),
-cb("april_aim_target_line", "Target Line", false, { 0.2, 1, 0.45, 1 }),
+cb("april_aimbot_enabled", "Enable Aimbot", false),
+hk("april_aimbot_key", "Aim Key (hold)", G, 0),
+sep(G),
+cb("april_aimbot_players", "Target Players", true, nil, G),
+cb("april_aimbot_team_check", "Team Check", true, nil, G, { tip = "Never targets your party or clan members. The same team check the player ESP uses." }),
+hk("april_aimbot_players_key", "Players Key", G, 0),
+combo("april_aimbot_player_mode", "Player Key Mode", { "Toggle", "Hold" }, 0, G),
+cb("april_aimbot_npcs", "Target NPCs (Military, Bosses, Zombies)", true, nil, G),
+hk("april_aimbot_npcs_key", "NPCs Key", G, 0),
+combo("april_aimbot_npc_mode", "NPC Key Mode", { "Toggle", "Hold" }, 0, G),
+cb("april_aim_whitelist", "Whitelist", false, nil, G, { tip = "Skips whitelisted players. Comma-separated Roblox user IDs below, or middle-click the current player target to toggle them." }),
+input("april_aim_whitelist_ids", "Whitelist IDs", "", G),
+btn("april_aim_whitelist_clear", "Clear Whitelist", G),
+sep(G),
+sl("april_aimbot_fov", "FOV Radius", 50, 500, 150, false, G),
+sl("april_aimbot_smooth", "Smoothing", 1, 20, 5, false, G),
+cb("april_aimbot_humanize", "Humanize", true, nil, G),
+combo("april_aimbot_bone", "Target Bone", { "Head", "UpperTorso", "LowerTorso", "Closest", "Random" }, 0, G),
+sl("april_aimbot_rand_head", "Head %", 0, 100, 50, false, G, { gate_combo = "april_aimbot_bone", gate_combo_value = 4 }),
+sl("april_aimbot_rand_upper", "Upper Torso %", 0, 100, 30, false, G, { gate_combo = "april_aimbot_bone", gate_combo_value = 4 }),
+sl("april_aimbot_rand_lower", "Lower Torso %", 0, 100, 20, false, G, { gate_combo = "april_aimbot_bone", gate_combo_value = 4 }),
+{ type = "label", label = "The three always add up to 100%.", dim = true, gate = G, gate_combo = "april_aimbot_bone", gate_combo_value = 4 },
+I.multi("april_aimbot_parts", "Hit Parts", { "Head", "Upper Torso", "Lower Torso" }, { true, true, true }, G, { gate_any_combo = { { "april_aimbot_bone", { 3, 4 } } }, tip = "Untick a part to never aim at it (Closest and Random). In Random its share goes to the parts left ticked." }),
+cb("april_aimbot_prediction", "Velocity Prediction", true, nil, G),
+cb("april_aimbot_sticky", "Sticky Aim", true, nil, G),
+cb("april_aimbot_visible_only", "Visible Only", false, nil, G),
+cb("april_aimbot_drop_prediction", "Bullet Drop Prediction", true, nil, G),
+cb("april_aimbot_auto_weapon", "Automatic Weapon Stats", true, nil, G),
+sl("april_aimbot_bullet_speed", "Bullet Speed", 100, 5000, 2100, false, G, { gate_off = "april_aimbot_auto_weapon" }),
+sl("april_aimbot_gravity", "Bullet Gravity", 0, 200, 108, false, G, { gate_off = "april_aimbot_auto_weapon" }),
+cb("april_aimbot_draw_fov", "Show FOV Circle", true, { 1, 1, 1, 1 }, G),
+cb("april_aimbot_fill_fov", "Fill FOV", false, { 1, 1, 1, 0.25 }, G, { gate2 = "april_aimbot_draw_fov", tip = "Fills the FOV circle. Set the fill color and how see-through it is with the color box." }),
+},
+}
+local indicators = {
+title = "Aimbot Indicators",
+items = {
+cb("april_aimbot_prediction_indicator", "Velocity Prediction Indicator", false, { 0, 1, 1, 1 }),
+cb("april_aimbot_drop_prediction_indicator", "Bullet Drop Indicator", false, { 1, 0.5, 0, 1 }),
+cb("april_aimbot_auto_weapon_indicator", "Automatic Weapon Calculation Indicator", false, { 1, 1, 1, 1 }),
+},
+}
+local H = "april_heli_aim_enabled"
+local heli = {
+title = "Attack Heli Aimbot",
+items = {
+cb(H, "Enable Heli Aimbot", false),
+hk("april_heli_aim_key", "Aim Key (hold)", H, 0),
+I.label("Uses the main Aim Key when this one is unbound.", true, H),
+sep(H),
+combo("april_heli_aim_target", "Aim Point", { "Auto (Best Weak Point)", "Main Rotor", "Tail Rotor", "Body" }, 0, H),
+sl("april_heli_aim_fov", "FOV Radius", 50, 800, 300, false, H),
+sl("april_heli_aim_smooth", "Smoothing", 1, 20, 3, false, H),
+sl("april_heli_aim_max_dist", "Max Distance", 100, 2000, 1000, false, H),
+cb("april_heli_aim_visible_only", "Visible Only", false, nil, H),
+cb("april_heli_aim_draw_fov", "Show FOV Circle", false, { 1, 0.55, 0.2, 1 }, H),
+cb("april_heli_aim_fill_fov", "Fill FOV", false, { 1, 0.55, 0.2, 0.25 }, H, { gate2 = "april_heli_aim_draw_fov", tip = "Fills the FOV circle. Set the fill color and how see-through it is with the color box." }),
+sep(H),
+cb("april_heli_aim_prediction", "Movement Prediction", true, nil, H),
+cb("april_heli_aim_accel", "Turn Prediction", true, nil, H),
+cb("april_heli_aim_drop", "Bullet Drop Compensation", true, nil, H),
+cb("april_heli_aim_auto_weapon", "Automatic Weapon Stats", true, nil, H),
+sl("april_heli_aim_bullet_speed", "Manual Bullet Speed", 100, 5000, 2100, false, H, { gate_off = "april_heli_aim_auto_weapon" }),
+sl("april_heli_aim_gravity", "Manual Gravity", 0, 300, 108, false, H, { gate_off = "april_heli_aim_auto_weapon" }),
+sl("april_heli_aim_latency", "Latency Compensation (ms)", 0, 300, 0, false, H),
+sl("april_heli_aim_lead", "Lead Scale %", 50, 150, 100, false, H),
+cb("april_heli_aim_debug", "Prediction Debug Overlay", false, { 1, 0.85, 0.2, 1 }, H),
 },
 }
 local R = "april_rcs_enabled"
@@ -29141,15 +29320,15 @@ sl("april_rcs_humanize_pct", "Humanize %", 0, 100, 40, false, R),
 I.label("Cancels recoil only. Move your mouse freely; it learns your sensitivity.", true, R),
 },
 }
-return { regular, recoil }
+return { aimbot, indicators, heli, recoil }
 end
 return M
 end)()
 
 April._mods["ui.catalog_visuals"] = (function()
 local I = April.require("ui.catalog_items")
-local cb, kb, sl, combo, multi, sep, color =
-I.cb, I.kb, I.sl, I.combo, I.multi, I.sep, I.color
+local gpu_chams = April.require("core.gpu_chams")
+local cb, kb, sl, combo, multi, sep, color = I.cb, I.kb, I.sl, I.combo, I.multi, I.sep, I.color
 local M = {}
 function M.build()
 local left = {
@@ -29173,6 +29352,13 @@ multi("april_player_esp_flags", "ESP Flags", {
 "Downed", "Safezone", "Staff", "Reviving", "Movement", "VIP", "Cheater", "Animation",
 }, { true, true, true, true, false, true, true, false }),
 sl("april_player_range", "Player Range", 50, 2000, 500),
+cb("april_player_chams", "Chams", false, nil, nil, { tip = "Chams on players. Engine is Vector's chams on the real body (like ahook); Overlay draws Vector's chams renderer in any color." }),
+combo("april_player_chams_type", "Chams Type", { "Engine (like ahook)", "Overlay" }, 0, "april_player_chams"),
+combo("april_player_chams_mode", "Chams Mode", gpu_chams.MODE_LABELS, 2, "april_player_chams", { gate_combo = "april_player_chams_type", gate_combo_value = 0 }),
+combo("april_player_chams_preset", "Glow Preset", gpu_chams.COLOR_LABELS, 1, "april_player_chams", { gate_combo = "april_player_chams_type", gate_combo_value = 0, gate_any_combo = { { "april_player_chams_mode", { 2, 3 } } } }),
+combo("april_player_chams_style", "Overlay Style", { "Filled", "Outline", "Glow" }, 0, "april_player_chams", { gate_combo = "april_player_chams_type", gate_combo_value = 1 }),
+{ type = "color", id = "april_player_chams_color", label = "Overlay Color", default = { 1, 0.25, 0.25, 0.5 }, gate = "april_player_chams", gate_combo = "april_player_chams_type", gate_combo_value = 1 },
+cb("april_player_chams_team", "Skip Teammates", true, nil, "april_player_chams", { tip = "Uses the same team check as the ESP." }),
 },
 }
 local gear = {
@@ -29184,36 +29370,6 @@ sl("april_target_overlay_fov", "Gear FOV", 5, 500, 100, false, "april_target_ove
 sl("april_target_overlay_max_dist", "Max Distance", 50, 2000, 500, false, "april_target_overlay"),
 sl("april_target_overlay_gear_size", "Gear Icon Size", 32, 64, 48, false, "april_target_overlay"),
 sl("april_target_overlay_top", "Top Offset", 48, 160, 88, false, "april_target_overlay"),
-},
-}
-local target_vis = {
-title = "Crosshair",
-items = {
-cb("april_crosshair_enabled", "Custom Crosshair", false),
-combo("april_crosshair_type", "Style", {
-"Cross", "Circle", "Dot", "T-Shape", "Diamond", "Plus", "Brackets", "X",
-}, 0, "april_crosshair_enabled"),
-cb("april_crosshair_follow", "Follow Target", false, nil, "april_crosshair_enabled"),
-combo("april_crosshair_source", "Target From", { "Auto", "Aimbot" }, 0, "april_crosshair_follow"),
-sl("april_crosshair_follow_smooth", "Follow Smoothness", 4, 40, 18, false, "april_crosshair_follow"),
-multi("april_ui_crosshair_motion", "Motion", { "Spin", "Pulse Size" }, { false, false }, "april_crosshair_enabled", {
-sync_ids = { "april_crosshair_spin", "april_crosshair_pulse" },
-}),
-sl("april_crosshair_spin_speed", "Spin Speed", 1, 100, 35, false, "april_crosshair_spin"),
-sl("april_crosshair_pulse_speed", "Pulse Speed", 1, 100, 40, false, "april_crosshair_pulse"),
-multi("april_ui_crosshair_options", "Options", {
-"Center Dot", "Outline", "Rainbow",
-}, { false, true, false }, "april_crosshair_enabled", {
-sync_ids = {
-"april_crosshair_dot", "april_crosshair_outline", "april_crosshair_rainbow",
-},
-}),
-color("april_crosshair_color", "Crosshair Color", { 0, 1, 0, 1 }, "april_crosshair_enabled"),
-color("april_crosshair_dot", "Center Dot Color", { 1, 1, 1, 1 }, "april_crosshair_dot"),
-sl("april_crosshair_rainbow_speed", "Rainbow Speed", 1, 100, 10, false, "april_crosshair_rainbow"),
-sl("april_crosshair_size", "Size", 1, 50, 10, false, "april_crosshair_enabled"),
-sl("april_crosshair_gap", "Gap", 0, 20, 5, false, "april_crosshair_enabled"),
-sl("april_crosshair_thickness", "Thickness", 1, 10, 2, false, "april_crosshair_enabled"),
 },
 }
 local colors = {
@@ -29237,7 +29393,26 @@ color("april_player_flag_cheater", "Cheater", { 1, 0.05, 0.05, 1 }),
 color("april_player_flag_animation", "Animation", { 0.95, 0.78, 1.0, 1 }),
 },
 }
-return { left, gear, target_vis, colors }
+local BT = "april_btracer_enabled"
+local tracers = {
+title = "Bullet Tracers",
+items = {
+cb(BT, "Bullet Tracers", false, { 0.35, 0.75, 1, 1 }, nil, { tip = "Draws a line for each of your shots, from your gun to where it lands. Drawn on top of everything, so tracers always show through walls." }),
+cb("april_btracer_hits_only", "Only Hit Tracers", false, nil, BT, { tip = "Only show tracers for shots that hit a player or NPC." }),
+color("april_btracer_hit_color", "Hit Color", { 1, 0.3, 0.35, 1 }, BT),
+combo("april_btracer_style", "Material", { "Neon", "Laser", "Smooth", "Lightning", "Dashed", "Pulse" }, 0, BT, { tip = "Neon: glowing beam. Laser: thin bright core. Smooth: plain line. Lightning: jagged flickering bolt. Dashed: dashed line. Pulse: a bright pulse runs along the beam." }),
+sl("april_btracer_time", "Display Time (s)", 0.2, 10, 2.5, true, BT),
+cb("april_btracer_fade", "Fade Out", true, nil, BT),
+sl("april_btracer_thickness", "Thickness", 1, 8, 2, false, BT),
+sl("april_btracer_glow", "Glow", 0, 10, 4, false, BT),
+combo("april_btracer_origin", "Start From", { "Gun", "Camera" }, 0, BT),
+combo("april_btracer_impact", "Impact Marker", { "None", "Dot", "Ring", "Cross", "Box" }, 1, BT),
+sl("april_btracer_impact_size", "Impact Size", 2, 16, 5, false, BT),
+cb("april_btracer_rainbow", "Rainbow", false, nil, BT),
+sl("april_btracer_max", "Max Tracers", 1, 100, 30, false, BT),
+},
+}
+return { left, gear, colors, tracers }
 end
 return M
 end)()
@@ -29328,6 +29503,12 @@ sync_ids = {
 sl("april_npc_range", "NPC Range", 50, 2000, 500),
 cb("april_npc_tracers", "Tracers", false),
 cb("april_npc_offscreen", "Offscreen Arrows", false),
+cb("april_npc_chams", "Chams", false, nil, nil, { tip = "Chams on the NPC types ticked above. Engine is Vector's chams on the real body (like ahook); Overlay draws Vector's chams renderer in any color." }),
+combo("april_npc_chams_type", "Chams Type", { "Engine (like ahook)", "Overlay" }, 0, "april_npc_chams"),
+combo("april_npc_chams_mode", "Chams Mode", April.require("core.gpu_chams").MODE_LABELS, 2, "april_npc_chams", { gate_combo = "april_npc_chams_type", gate_combo_value = 0 }),
+combo("april_npc_chams_preset", "Glow Preset", April.require("core.gpu_chams").COLOR_LABELS, 3, "april_npc_chams", { gate_combo = "april_npc_chams_type", gate_combo_value = 0, gate_any_combo = { { "april_npc_chams_mode", { 2, 3 } } } }),
+combo("april_npc_chams_style", "Overlay Style", { "Filled", "Outline", "Glow" }, 0, "april_npc_chams", { gate_combo = "april_npc_chams_type", gate_combo_value = 1 }),
+{ type = "color", id = "april_npc_chams_color", label = "Overlay Color", default = { 1, 0.75, 0.2, 0.5 }, gate = "april_npc_chams", gate_combo = "april_npc_chams_type", gate_combo_value = 1 },
 },
 }
 local npc_colors = {
@@ -29364,50 +29545,10 @@ end)()
 
 April._mods["ui.catalog_misc"] = (function()
 local I = April.require("ui.catalog_items")
-local cb, kb, sl, combo, multi, sep =
-I.cb, I.kb, I.sl, I.combo, I.multi, I.sep
+local cb, kb, sl, combo, multi, sep = I.cb, I.kb, I.sl, I.combo, I.multi, I.sep
 local M = {}
 function M.build()
 return {
-{
-title = "Combat Movement",
-items = {
-kb("april_desync_enabled", "Desync", false),
-cb("april_desync_visualizer", "Desync Visualize", false, { 0.2, 0.85, 1, 0.9 }, "april_desync_enabled"),
-sep(),
-kb("april_antiaim_enabled", "Anti-Aim", false),
-combo("april_antiaim_yaw_mode", "Yaw Mode", { "None", "Backwards", "Spin", "Jitter", "Random Jitter", "Sideways Left", "Sideways Right", "Manual" }, 1, "april_antiaim_enabled"),
-sl("april_antiaim_yaw_manual", "Manual Yaw", -180, 180, 90, false, "april_antiaim_enabled", {
-gate_combo = "april_antiaim_yaw_mode",
-gate_combo_value = 7,
-}),
-sl("april_antiaim_spin_speed", "Spin Speed", 30, 720, 180, false, "april_antiaim_enabled", {
-gate_combo = "april_antiaim_yaw_mode",
-gate_combo_value = 2,
-}),
-sl("april_antiaim_jitter_step", "Jitter Step", 15, 180, 90, false, "april_antiaim_enabled", {
-gate_any_combo = {
-{ "april_antiaim_yaw_mode", { 3, 4 } },
-},
-}),
-sl("april_antiaim_jitter_ms", "Jitter Interval (ms)", 40, 500, 120, false, "april_antiaim_enabled", {
-gate_any_combo = {
-{ "april_antiaim_yaw_mode", { 3, 4 } },
-},
-}),
-kb("april_fakeduck_enabled", "Fake Duck", false),
-sl("april_fakeduck_height", "Duck Height", 0.01, 1.5, 1.1, true, "april_fakeduck_enabled"),
-cb("april_fakeduck_spam", "Spam Height", false, nil, "april_fakeduck_enabled"),
-combo("april_fakeduck_spam_mode", "Spam Mode", { "Alternating", "Random" }, 0, "april_fakeduck_spam"),
-sl("april_fakeduck_spam_min", "Spam Min", 0.01, 1.5, 0.01, true, "april_fakeduck_spam"),
-sl("april_fakeduck_spam_max", "Spam Max", 0.01, 1.5, 1.5, true, "april_fakeduck_spam"),
-sl("april_fakeduck_spam_ms", "Spam Interval (ms)", 20, 400, 80, false, "april_fakeduck_spam"),
-sep(),
-kb("april_fling_enabled", "Fling", false),
-sl("april_fling_fov", "Fling FOV", 5, 600, 150, false, "april_fling_enabled"),
-sl("april_fling_duration", "Fling Duration", 2, 10, 2, false, "april_fling_enabled"),
-},
-},
 {
 title = "Automation",
 items = {
@@ -29416,12 +29557,40 @@ multi("april_autofarm_resources", "Farm Resources", {
 "Trees", "Stone", "Metal", "Phosphate",
 }, { true, true, true, true }, "april_autofarm"),
 sl("april_autofarm_search_range", "Search Range", 50, 2000, 500, false, "april_autofarm"),
+sl("april_autofarm_rotation", "Rotation Speed %", 1, 100, 90, false, "april_autofarm"),
 cb("april_autofarm_debug_path", "Debug Target Path", false, nil, "april_autofarm"),
 sep(),
 kb("april_farm_helper", "Manual Farm Helper", false),
 sl("april_farm_radius", "Farm Range (studs)", 1, 10, 7, false, "april_farm_helper"),
+sl("april_farm_rotation", "Rotation Speed %", 1, 100, 90, false, "april_farm_helper"),
 },
 },
+(function()
+local HS = "april_hitsound_enabled"
+local ok, group = pcall(function()
+local audio = April.require("core.audio")
+local items = {
+cb(HS, "Hitsounds", false, nil, nil, { tip = "Plays your own .wav files when your shot hits: one folder for headshots, one for every other hit." }),
+combo("april_hitsound_head", "Headshot Sound", audio.labels("headshot"), audio.default_index("headshot", "Rust Headshot"), HS),
+combo("april_hitsound_body", "Hit Sound", audio.labels("hit"), audio.default_index("hit", "Rust Hit"), HS),
+cb("april_hitsound_confirm", "Only When Damage Lands", true, nil, HS, { tip = "Waits until the player's health drops before playing, so misses and blocked shots stay silent. NPCs play right away." }),
+cb("april_hitsound_npcs", "NPC Hits", true, nil, HS),
+I.btn("april_hitsound_test_head", "Test Headshot Sound", HS),
+I.btn("april_hitsound_test_body", "Test Hit Sound", HS),
+I.btn("april_hitsound_refresh", "Refresh Sound List", HS),
+I.label("Put .wav files in April_configs\\hitsounds\\headshot and \\hit, then Refresh Sound List.", true, HS),
+}
+if not audio.available() then
+items[#items + 1] = I.label("Vector can't play sounds on this setup, so Hitsounds stay silent.", true, HS)
+end
+return { title = "Hitsounds", items = items }
+end)
+if ok and type(group) == "table" then return group end
+return { title = "Hitsounds", items = {
+cb(HS, "Hitsounds", false),
+I.label("Hitsounds couldn't load on this setup.", true, HS),
+} }
+end)(),
 {
 title = "Event Status",
 master = "april_event_status_enabled",
@@ -29614,10 +29783,9 @@ if labels and #labels > 0 then
 cfg_labels = labels
 end
 end)
-local config_group = {
-title = "Config",
-items = {
-cb("april_ui_russian", "Russkiy yazyk", false),
+local config_items = {
+combo("april_ui_language", "Language", { "English", "Russian", "Tieng Viet" }, 0, nil,
+	{ tip = "Switch the April interface and HUD text to the selected language." }),
 sep(),
 I.label("Configs", true),
 input("april_cfg_profile_name", "Config Name", "Default"),
@@ -29626,6 +29794,10 @@ btn("april_cfg_save", "Save Config"),
 btn("april_cfg_load", "Load Config"),
 btn("april_cfg_delete", "Delete Config"),
 btn("april_cfg_refresh", "Refresh List"),
+btn("april_cfg_preset_nhandzqn", "Config nhandzqn"),
+btn("april_cfg_default", "Config Default"),
+}
+I.append(config_items, {
 sep(),
 I.label("Autoload", true),
 cb("april_cfg_autoload", "Autoload on Start", false),
@@ -29634,7 +29806,10 @@ sep(),
 I.label("Extras", true),
 sl("april_esp_text_size", "ESP Text Size", 8, 24, 13),
 btn("april_reload_modules", "Reload Game Modules"),
-},
+})
+local config_group = {
+title = "Config",
+items = config_items,
 }
 return { appearance, motion, accent, anime_baddie, config_group }
 end
@@ -29644,14 +29819,16 @@ end)()
 April._mods["ui.catalog"] = (function()
 local M = {}
 M.TABS = {
+{ id = "rage", icon = "skull", title = "RAGE", label = "RAGE", description = "Ragebot and silent aim" },
 { id = "aim", icon = "aim", title = "Combat", label = "Aim", description = "Targeting and aim behavior" },
-{ id = "visuals", icon = "visuals", title = "Visuals", label = "Visuals", description = "Player information, crosshair, and gear" },
+{ id = "visuals", icon = "visuals", title = "Visuals", label = "Visuals", description = "Player information and gear" },
 { id = "world", icon = "world", title = "World", label = "World", description = "Resources, loot, NPCs, raids, and bases" },
-{ id = "misc", icon = "misc", title = "Movement & Utility", label = "Misc", description = "Movement, automation, and events" },
+{ id = "misc", icon = "misc", title = "Utility", label = "Misc", description = "Automation and events" },
 { id = "radar", icon = "radar", title = "Radar", label = "Radar", description = "Tactical map layers" },
 { id = "config", icon = "config", title = "Settings", label = "Config", description = "Appearance, motion, profiles, and extras" },
 }
 local BUILDERS = {
+rage = "ui.catalog_rage",
 aim = "ui.catalog_aim",
 visuals = "ui.catalog_visuals",
 world = "ui.catalog_world",
@@ -29762,10 +29939,11 @@ local function build_entries()
     entries = out
 end
 local function match_rank(entry, query)
-    local q = lower(query):match("^%s*(.-)%s*$") or ""
+    local q = lower(query):match("^[ \t\r\n]*(.-)[ \t\r\n]*$") or ""
     if q == "" then return nil end
+    if i18n.is_vi() then q = i18n.fold_vi(q) end
     local cursor = 1
-    for token in q:gmatch("%S+") do
+    for token in q:gmatch("[^ \t\r\n]+") do
         local found = entry.haystack:find(token, 1, true)
         if not found then return nil end
         cursor = cursor + found
@@ -30747,11 +30925,15 @@ end
 local col = active and anim.tab_icon_color() or anim.mix(theme.TEXT_DIM, theme.TEXT, emphasis * 0.45)
 local i18n = April.require("ui.i18n")
 local label = i18n.t(tab.label or tab.title or tab.id)
-local icon_x = cursor_x + 16
+local icon_w = 20
+local icon_gap = theme.NAV_ICON_GAP or 7
+local label_max_w = math.max(0, tab_w - icon_w - icon_gap - 16)
+local label_w = math.min(text_width(label, theme.FONT_CAPTION), label_max_w)
+local content_x = cursor_x + math.floor((tab_w - icon_w - icon_gap - label_w) * 0.5)
 local cy = y + h * 0.5
-icons.draw(tab.icon or tab.id, icon_x, cy, col, 0.72)
-widgets.text(cursor_x + 29, cy - math.floor(theme.FONT_CAPTION * 0.5) - 1,
-label, col, theme.FONT_CAPTION)
+icons.draw(tab.icon or tab.id, content_x + icon_w * 0.5, cy, col)
+widgets.text(content_x + icon_w + icon_gap, cy - math.floor(theme.FONT_CAPTION * 0.5) - 1,
+label, col, theme.FONT_CAPTION, label_max_w)
 if gin.clicked(cursor_x, tab_y, tab_w, tab_h) and not widgets.block_under then
 tab_index = i
 scroll.left = 0
@@ -30925,7 +31107,7 @@ widgets.rect(x + 5, box_top + 8, 2, theme.GROUP_HEADER_H - 16,
 theme.ACCENT, true, 1)
 end
 widgets.text(x + 14, box_top + 8, title,
-active and theme.TEXT_ACTIVE or theme.TEXT, theme.FONT_TITLE)
+active and theme.TEXT_ACTIVE or theme.TEXT, theme.FONT_TITLE, w - 42)
 local cx = x + w - 16
 local cy = box_top + theme.GROUP_HEADER_H * 0.5
 local line = draw and (draw.line or draw.Line)
@@ -31119,7 +31301,11 @@ state.define("april_ui_snow_speed", 40)
 state.define("april_ui_snow_size", 3)
 state.define("april_ui_snow_opacity", 55)
 state.define("april_ui_menu_fade", false)
+state.define("april_ui_language", 0)
 state.define("april_ui_russian", false)
+state.on_change("april_ui_language", function(v)
+state.set("april_ui_russian", tonumber(v) == 1)
+end)
 state.define("april_ui_anim_targets", {
 true, true, true, true, true, true, true, true,
 })
@@ -31328,6 +31514,3779 @@ end
 return M
 end)()
 
+April._mods["core.silent_hook"] = (function()
+-- One shared switch for Vector's raycast hook, used by silent aim and the ragebot: the hook
+-- stays on while either wants it, and only the feature that last pointed the shot can clear
+-- it. M.last records where shots are being sent (bullet tracers read it).
+local notify = April.require("core.notify")
+local M = {}
+local users = {}
+local hook_on, hook_failed = false, false
+local active = nil
+M.last = nil
+local function now_ms()
+    local fn = utility and (utility.get_tick_count or utility.GetTickCount)
+    if type(fn) ~= "function" then return 0 end
+    local ok, v = pcall(fn)
+    return ok and tonumber(v) or 0
+end
+local function key_down(vk)
+    local fn = input and (input.is_key_down or input.IsKeyDown)
+    if type(fn) ~= "function" then return false end
+    local ok, v = pcall(fn, vk)
+    return ok and v == true
+end
+local function rc(snake, pascal)
+    return raycast and (raycast[snake] or raycast[pascal]) or nil
+end
+local function clear()
+    local fn = rc("stop_silent_tracking", "StopSilentTracking")
+    if fn then pcall(fn) end
+    fn = rc("clear_silent_target", "ClearSilentTarget")
+    if fn then pcall(fn) end
+end
+function M.is_on()
+    return hook_on
+end
+function M.active_owner()
+    return active
+end
+function M.acquire(owner)
+    users[owner] = true
+    if hook_on then return true end
+    if hook_failed then return false end
+    local fn = rc("enable_silent_hook", "EnableSilentHook")
+    local ok, res = false, false
+    if fn then ok, res = pcall(fn) end
+    if not ok or res == false then
+        hook_failed = true
+        pcall(notify.warning or notify.info, "Vector's raycast hook is not available", 5000)
+        return false
+    end
+    hook_on = true
+    return true
+end
+function M.stop(owner)
+    if active ~= owner then return end
+    active = nil
+    M.last = nil
+    clear()
+end
+function M.release(owner)
+    M.stop(owner)
+    users[owner] = nil
+    if hook_on and next(users) == nil then
+        local fn = rc("disable_silent_hook", "DisableSilentHook")
+        if fn then pcall(fn) end
+        hook_on = false
+    end
+end
+local function vec(t)
+    return Vector3.New(t.x, t.y, t.z)
+end
+-- Points shots fired while `key` is held at origin + dir.
+function M.track(owner, origin, dir, key, meta)
+    if not hook_on or not (Vector3 and Vector3.New) then return false end
+    local ok = false
+    local track = rc("track_silent_target", "TrackSilentTarget")
+    if track then
+        ok = pcall(track, vec(origin), vec(dir), key)
+    elseif key_down(key) then
+        local set = rc("set_silent_target", "SetSilentTarget")
+        if set then ok = pcall(set, vec(origin), vec(dir)) end
+    end
+    if ok then
+        active = owner
+        M.last = { t = now_ms(), origin = origin, dir = dir, owner = owner, key = key, meta = meta }
+    end
+    return ok
+end
+-- Points every shot this frame at origin + dir; call it every frame you want it.
+function M.set(owner, origin, dir, meta)
+    if not hook_on or not (Vector3 and Vector3.New) then return false end
+    local set = rc("set_silent_target", "SetSilentTarget")
+    local ok = set ~= nil and pcall(set, vec(origin), vec(dir))
+    if ok then
+        active = owner
+        M.last = { t = now_ms(), origin = origin, dir = dir, owner = owner, meta = meta }
+    end
+    return ok == true
+end
+-- Where a shot fired right now would be sent, if a feature is pointing shots.
+function M.current_dir(max_age_ms)
+    local l = M.last
+    if not l then return nil end
+    if now_ms() - l.t > (max_age_ms or 120) then return nil end
+    if l.key and not key_down(l.key) then return nil end
+    return l.dir, l.owner, l.meta, l.origin
+end
+return M
+end)()
+
+April._mods["game.wiki_images"] = (function()
+-- Colored inventory icons from the Fallen Survival wiki for items Fallen itself has no icon
+-- for (most tools, food, ammo, components) and for attachments, whose old pictures were
+-- untextured grey mesh renders. The wiki only serves images to browsers, so they are fetched
+-- through the same image proxy the map uses, scaled down to 128px.
+local M = {}
+local BASE = "static.wikia.nocookie.net/fallen-survival-new/images/"
+local PROXY = "https://wsrv.nl/?output=png&w=128&h=128&fit=contain&url="
+M.by_name = {
+    ["Ammo Press"] = "a/af/Ammo_Press_v2.png",
+    ["Armor Plate"] = "5/5f/Armourplate.png",
+    ["Armor Polish"] = "1/18/Polish.png",
+    ["Bandage"] = "0/0c/Bandage.png",
+    ["Bean Can"] = "7/7d/Bean_Can.png",
+    ["Beef MRE"] = "c/c2/Beef_MRE.png",
+    ["Blade"] = "e/e5/Blade.webp",
+    ["Blueberries"] = "a/af/Blueberries.png",
+    ["Blueberry Pie I"] = "f/f0/Blueberry_1.png",
+    ["Blueberry Pie II"] = "6/6b/Blue_berry_2.png",
+    ["Blueberry Pie III"] = "8/88/Blueberry_3.png",
+    ["Blueberry Pie IV"] = "c/cf/Blueberry_4.png",
+    ["Blueprint"] = "9/98/Blueprint.png",
+    ["Bone Arrow"] = "e/ea/Bone_Arrow.png",
+    ["Bruno's ACOG Sight"] = "2/23/Bruno%27s_ACOG_Sight.png",
+    ["Cactus Flesh"] = "6/6b/Cactusflesh.png",
+    ["Carpentry Table"] = "b/bf/Carpentry_Table_v2.png",
+    ["Chemistry Lab"] = "5/55/Chemistry_Lab_v2.png",
+    ["Chicken MRE"] = "b/bd/Chicken_MRE.png",
+    ["Chocolate Bar"] = "c/c5/Chocolate_Bar.png",
+    ["Circuit Boards"] = "7/76/Circuit_Boards.webp",
+    ["Clan Table"] = "9/9f/Clan_Table.png",
+    ["Combustive Arrow"] = "5/56/Combustive_Arrow.png",
+    ["Combustive Heavy Ammo"] = "0/0e/Combustive_Heavy_Ammo.png",
+    ["Combustive Rocket"] = "d/d4/Combustive_Rocket.png",
+    ["Compensator"] = "e/e5/Compensator.png",
+    ["Copper Cogs"] = "e/e8/Copper_Cogs.png",
+    ["Corn"] = "f/f8/Corn.png",
+    ["Corn Bread I"] = "b/bd/Corn_bread.png",
+    ["Corn Bread II"] = "b/b5/Corn_bea.png",
+    ["Corn Bread III"] = "f/fb/Corn_bead_3.png",
+    ["Corn Bread IV"] = "e/e9/Corn_bread_4.png",
+    ["Crude Fuel"] = "a/a8/Crude_Fuel.png",
+    ["Culinary Table"] = "6/63/Culinary_Table_v2.png",
+    ["Duct Tape"] = "0/07/Tape.webp",
+    ["Dynamite Bundle"] = "b/b3/Dynamite_Bundle.png",
+    ["Dynamite Stick"] = "2/20/Dynamite_Stick.png",
+    ["Extended Mag"] = "9/96/Extended_Mag.png",
+    ["External Stone Gate"] = "b/be/External_Stone_Gate.png",
+    ["External Stone Wall"] = "5/50/External_Stone_Wall.png",
+    ["External Wooden Gate"] = "b/b4/External_Wooden_Gate.png",
+    ["External Wooden Wall"] = "0/01/External_Wooden_Wall.png",
+    ["Fish Can"] = "3/39/Fish_Can.png",
+    ["Glue"] = "0/04/Glue.webp",
+    ["Gunpowder"] = "a/ae/Gunpowder.png",
+    ["Heavy Ammo"] = "6/6f/Heavy_Ammo.png",
+    ["Heavy Padding"] = "d/dd/Heavypadding.png",
+    ["Holo Sight"] = "7/72/Holo_Sight.png",
+    ["Lemon"] = "3/35/Lemon.png",
+    ["Light Ammo"] = "2/22/Light_Ammo.png",
+    ["Meatball Can"] = "6/6e/Meatballcan.png",
+    ["Metal Plating"] = "d/df/Metal_Plating.webp",
+    ["Metal Scraps"] = "1/1a/Metal_Scraps.webp",
+    ["Military ACOG Sight"] = "e/ec/Military_ACOG_Sight.png",
+    ["Military Grenade"] = "e/e8/Military_Grenade.png",
+    ["Military Lasersight"] = "d/d4/Military_Lasersight.png",
+    ["Military Sniper Scope"] = "0/0a/Military_Sniper_Scope.png",
+    ["Milk"] = "9/92/Milk.png",
+    ["Muzzle Boost"] = "5/5a/Muzzle_Boost.png",
+    ["Piercing Heavy Ammo"] = "e/e0/Piercing_Heavy_Ammo.png",
+    ["Piercing Light Ammo"] = "f/f2/Piercing_Light_Ammo.png",
+    ["Pink Keycard"] = "1/19/Pink_Keycard.webp",
+    ["Pipe"] = "a/a1/Pipe.webp",
+    ["Pistol Receiver"] = "0/04/Pistol_Receiver.png",
+    ["Power Cell"] = "6/61/Power_Cell.webp",
+    ["Pumpkin Launcher"] = "b/b1/Pumpkin_Launcher_.png",
+    ["Pumpkin Pie"] = "d/dc/Pumpkin_pie.png",
+    ["Pumpkin Plant Seed"] = "3/39/Pumpkin_Plant_Seed.png",
+    ["Purple Keycard"] = "1/18/Purple_Keycard.webp",
+    ["Raspberries"] = "7/7e/Raspberries.png",
+    ["Raspberry Pie I"] = "b/b8/Raspberry_1.png",
+    ["Raspberry Pie II"] = "c/cb/Raspberry_2.png",
+    ["Raspberry Pie III"] = "6/68/Raspberry_3.png",
+    ["Raspberry Pie IV"] = "b/b8/Rasberry_4.png",
+    ["Red Keycard"] = "f/f1/Red_Keycard.webp",
+    ["Rifle Receiver"] = "e/e4/Rifle_Receiver.png",
+    ["Rocket"] = "f/fb/Rocket.png",
+    ["Rope"] = "7/72/Rope.webp",
+    ["SMG Receiver"] = "f/fc/SMG_Receiver.webp",
+    ["Salvaged Lasersight"] = "b/b4/Salvaged_Lasersight.png",
+    ["Salvaged Shell"] = "e/e6/Salvaged_Shell.png",
+    ["Salvaged Sight"] = "b/bd/Salvaged_Sight.png",
+    ["Salvaged Sniper Scope"] = "f/f3/Salvaged_Sniper_Scope.png",
+    ["Saw Bat"] = "4/42/Saw_Bat.png",
+    ["Semi Receiver"] = "5/5d/Semi_Receiver.webp",
+    ["Sewing Table"] = "e/e7/Sewing_Table_v.2.png",
+    ["Silencer"] = "4/43/Silencer.png",
+    ["Small Medkit"] = "c/c5/Small_Medkit.png",
+    ["Small Wooden Sign"] = "4/44/Small_Wooden_Sign.png",
+    ["Spring"] = "4/44/Spring.webp",
+    ["Stone"] = "d/d4/Stone.png",
+    ["Stone Spear"] = "5/50/Stone_Spear.png",
+    ["Swift Arrow"] = "0/05/Swift_Arrow.png",
+    ["Swift Heavy Ammo"] = "4/4f/Swift_Heavy_Ammo.png",
+    ["Swift Light Ammo"] = "6/62/Swift_Light_Ammo.png",
+    ["Swift Rocket"] = "9/92/Swift_Rocket.png",
+    ["Tarp"] = "b/b2/Tarp.webp",
+    ["Thread"] = "9/94/Thread.webp",
+    ["Timed Charge"] = "6/6d/Timed_Charge.png",
+    ["Tomato"] = "9/9d/Tomato.png",
+    ["Weapon Flashlight"] = "d/d4/Weapon_Flashlight.png",
+    ["Wood Log"] = "b/bd/Wood_Log.png",
+    ["Wooden Arrow"] = "f/ff/Wooden_Arrow.png",
+    ["Wooden Spear"] = "1/17/Wooden_Spear.png",
+    ["Wooden Spikes"] = "e/e6/Wooden_Spikes.png",
+    ["Yellow Keycard"] = "d/db/Yellow_Keycard.webp",
+}
+function M.get_url(name)
+    local path = name and M.by_name[name]
+    if not path then return nil end
+    return PROXY .. BASE .. path
+end
+return M
+end)()
+
+April._mods["game.damage"] = (function()
+-- Damage of one hit, used by the ragebot's Min Damage and its target info. From the Fallen
+-- Survival wiki: the gun's damage and dropoff band, headshots 1.5x (Crossbow, Pipe Rifle and
+-- Barrett 1.75x, Wooden Bow 1.6x), body 1x, the Silencer (-20%) and Compensator (-10%) on your
+-- gun, and the bullet protection of what the target wears where the shot lands. Each piece
+-- protects its own area and pieces on the same area add up (a full steel set totals over 100%,
+-- so it cannot be one shared number). The game's ToolInfo still wins whenever it is loaded.
+-- The one number no source gives is how low damage gets at the end of the dropoff band; it is
+-- taken as a straight line from full damage at the start to DROPOFF_FLOOR at the end.
+local weapons = April.require("game.weapons")
+local M = {}
+M.DEFAULT_BASE = 30
+M.HEADSHOT = 1.5
+M.DROPOFF_FLOOR = 0.5
+local ARMOR_TTL_MS = 1500
+local OWN_TTL_MS = 1000
+local HEAD, BODY, LEGS = "head", "body", "legs"
+-- bullet protection of each item (wiki armor and clothing tables) and the areas it covers
+M.ARMOR = {
+    ["Wooden Helmet"] = { 0.15, HEAD }, ["Salvaged Helmet"] = { 0.35, HEAD },
+    ["Steel Helmet"] = { 0.50, HEAD }, ["Military Helmet"] = { 0.45, HEAD },
+    ["Bruno's Helmet"] = { 0.45, HEAD }, ["Altyn Helmet"] = { 0.48, HEAD },
+    ["Hard Hat"] = { 0.20, HEAD }, ["Baseball Cap"] = { 0.05, HEAD },
+    ["Balaclava"] = { 0.10, HEAD }, ["Cloth Headwrap"] = { 0.10, HEAD },
+    ["Wooden Chestplate"] = { 0.10, BODY }, ["Salvaged Chestplate"] = { 0.20, BODY },
+    ["Steel Chestplate"] = { 0.30, BODY }, ["Military Chestplate"] = { 0.25, BODY },
+    ["Bruno's Chestplate"] = { 0.25, BODY }, ["Boris's Chestplate"] = { 0.25, BODY },
+    ["Bone Armor"] = { 0.13, BODY }, ["Hoodie"] = { 0.20, BODY },
+    ["Collared Shirt"] = { 0.15, BODY }, ["Leather Shirt"] = { 0.10, BODY },
+    ["Cloth Shirt"] = { 0.05, BODY }, ["Tank Top"] = { 0.05, BODY },
+    ["Flannel Jacket"] = { 0.15, BODY }, ["Leather Poncho"] = { 0.10, BODY },
+    ["Wooden Leggings"] = { 0.10, LEGS }, ["Salvaged Leggings"] = { 0.15, LEGS },
+    ["Steel Leggings"] = { 0.25, LEGS }, ["Military Leggings"] = { 0.20, LEGS },
+    ["Pants"] = { 0.15, LEGS }, ["Leather Pants"] = { 0.10, LEGS }, ["Cloth Pants"] = { 0.05, LEGS },
+    ["Hazmat Suit"] = { 0.25, HEAD, BODY, LEGS },
+}
+local PART_AREA = { Head = HEAD, UpperTorso = BODY, LowerTorso = BODY, Torso = BODY }
+-- Fallen's chest armor models cover the arm pieces and the leggings cover the legs and feet
+for _, side in ipairs({ "Left", "Right" }) do
+    for _, piece in ipairs({ "UpperArm", "LowerArm", "Hand" }) do PART_AREA[side .. piece] = BODY end
+    for _, piece in ipairs({ "UpperLeg", "LowerLeg", "Foot" }) do PART_AREA[side .. piece] = LEGS end
+    PART_AREA[side .. " Arm"] = BODY
+    PART_AREA[side .. " Leg"] = LEGS
+end
+local MULT_KEYS = {
+    Head = { "HeadshotMultiplier", "HeadMultiplier", "HeadshotMult", "HeadMult" },
+    UpperTorso = { "TorsoMultiplier", "BodyMultiplier", "ChestMultiplier" },
+    LowerTorso = { "LowerTorsoMultiplier", "BodyMultiplier" },
+}
+local PELLET_KEYS = { "Pellets", "PelletCount", "BulletCount", "Bullets" }
+local function now_ms()
+    local fn = utility and (utility.get_tick_count or utility.GetTickCount)
+    if type(fn) ~= "function" then return 0 end
+    local ok, v = pcall(fn)
+    return ok and tonumber(v) or 0
+end
+-- "Boris Chestplate", "Boris's Chestplate" and "Cloth Head Wrap" / "Cloth Headwrap" match
+local function norm(name)
+    return (tostring(name or ""):lower():gsub("'s", ""):gsub("[^%w]", ""))
+end
+local ARMOR_BY_KEY = {}
+for name, row in pairs(M.ARMOR) do
+    local areas = {}
+    for i = 2, #row do areas[row[i]] = true end
+    ARMOR_BY_KEY[norm(name)] = { bullet = row[1], areas = areas }
+end
+local function num_in(t, keys)
+    if type(t) ~= "table" then return nil end
+    for _, k in ipairs(keys) do
+        local v = tonumber(t[k])
+        if v and v > 0 then return v end
+    end
+    return nil
+end
+local function entry_of(weapon_name)
+    if not weapon_name then return nil end
+    local ok, e = pcall(weapons.get, weapon_name)
+    return ok and type(e) == "table" and e or nil
+end
+local function wiki_of(weapon_name)
+    if not weapon_name or not weapons.wiki_stats then return nil end
+    local ok, w = pcall(weapons.wiki_stats, weapon_name)
+    return ok and type(w) == "table" and w or nil
+end
+-- Base damage of one shot and whether it is known (game data or wiki) rather than the fallback.
+function M.base(weapon_name)
+    local entry = entry_of(weapon_name)
+    if entry then
+        for _, t in ipairs({ entry.Bullet, entry.Weapon, entry }) do
+            local d = num_in(t, { "Damage", "BaseDamage", "BulletDamage" })
+            if d then
+                local pellets = num_in(entry.Bullet, PELLET_KEYS) or num_in(entry.Weapon, PELLET_KEYS) or 1
+                return d * pellets, true
+            end
+        end
+    end
+    local wiki = wiki_of(weapon_name)
+    if wiki and wiki.dmg then return wiki.dmg, true end
+    return M.DEFAULT_BASE, false
+end
+function M.multiplier(weapon_name, part)
+    local keys = MULT_KEYS[part]
+    local entry = entry_of(weapon_name)
+    if keys and entry then
+        local v = num_in(entry.Bullet, keys) or num_in(entry.Weapon, keys) or num_in(entry, keys)
+        if v then return v end
+    end
+    if part == "Head" then
+        local wiki = wiki_of(weapon_name)
+        return wiki and wiki.hs or M.HEADSHOT
+    end
+    return 1
+end
+-- Share of damage left at a distance: full up to the start of the dropoff band, then a straight
+-- line down to DROPOFF_FLOOR at its end.
+function M.dropoff(weapon_name, dist)
+    local wiki = wiki_of(weapon_name)
+    local band = wiki and wiki.drop
+    if not band or not dist then return 1 end
+    local a, b = band[1], band[2]
+    if dist <= a then return 1 end
+    if dist >= b or b <= a then return M.DROPOFF_FLOOR end
+    return 1 - (1 - M.DROPOFF_FLOOR) * (dist - a) / (b - a)
+end
+local function scan_gear(who)
+    local ok, gear = pcall(function() return April.require("game.player_gear").scan_player(who) end)
+    return ok and type(gear) == "table" and gear or nil
+end
+-- Bullet protection from a list of worn item names, for one hit area.
+function M.protection_of(names, part)
+    local area = PART_AREA[part]
+    if not area then return 0 end
+    local sum = 0
+    for _, n in ipairs(names or {}) do
+        local a = ARMOR_BY_KEY[norm(n)]
+        if a and a.areas[area] then sum = sum + a.bullet end
+    end
+    return math.min(sum, 1)
+end
+local worn = {}
+local worn_count = 0
+local function key_of(obj)
+    local ok, a = pcall(function() return obj.Address end)
+    if ok and a then return tostring(a) end
+    return tostring(obj)
+end
+-- What a target wears, read the same way as the Inventory Viewer, kept for 1.5s.
+function M.worn(target)
+    if not target or not target.obj then return {} end
+    local key = key_of(target.obj)
+    local now = now_ms()
+    local c = worn[key]
+    if c and now - c.t < ARMOR_TTL_MS then return c.names end
+    local names = {}
+    local gear = scan_gear({ character = target.obj, player = target.player })
+    for _, piece in ipairs(gear and gear.armor or {}) do
+        if piece.name then names[#names + 1] = piece.name end
+    end
+    if not c then
+        worn_count = worn_count + 1
+        if worn_count > 96 then
+            for k, v in pairs(worn) do
+                if now - v.t > ARMOR_TTL_MS * 4 then worn[k] = nil; worn_count = worn_count - 1 end
+            end
+        end
+    end
+    worn[key] = { t = now, names = names }
+    return names
+end
+function M.protection(target, part)
+    return M.protection_of(M.worn(target), part)
+end
+local own = { t = -1e9, mult = 1 }
+-- Damage change from the attachments on your own gun.
+function M.attachment_mult()
+    local now = now_ms()
+    if now - own.t < OWN_TTL_MS then return own.mult end
+    local mult = 1
+    local lp, char = nil, nil
+    pcall(function()
+        lp = April.require("core.env").get_local_player()
+        char = lp.Character
+    end)
+    local gear = lp and scan_gear({ player = lp, character = char }) or nil
+    for _, a in ipairs(gear and gear.attachments or {}) do
+        local n = tostring(a.name or ""):lower()
+        if n:find("silencer", 1, true) or n:find("suppressor", 1, true) then
+            mult = mult * 0.8
+        elseif n:find("compensator", 1, true) then
+            mult = mult * 0.9
+        end
+    end
+    own.t, own.mult = now, mult
+    return mult
+end
+-- One hit with this gun on this part. With a target and distance it counts their armor and the
+-- dropoff; without, it is the most one hit can do.
+function M.estimate(weapon_name, part, target, dist)
+    local base, known = M.base(weapon_name)
+    local dmg = base * M.multiplier(weapon_name, part)
+    if target then
+        dmg = dmg * M.attachment_mult() * M.dropoff(weapon_name, dist) * (1 - M.protection(target, part))
+    end
+    return dmg, known
+end
+return M
+end)()
+
+April._mods["game.shots"] = (function()
+-- Your own shots, shared by bullet tracers and hitsounds. A shot is noticed when Fallen puts its
+-- bullet effect (ShotTracer, RifleBullet, arrows...) beside your camera, or, if no effect shows
+-- up, when you click with a gun out. Each shot is resolved once: where it went (toward the
+-- silent aim / ragebot target when one of them is pointing the shot, otherwise along your
+-- crosshair), whether it ended on a character, and whether that was the head. Every feature
+-- that subscribed gets its own copy of each shot.
+local env = April.require("core.env")
+local silent_hook = April.require("core.silent_hook")
+local weapons = April.require("game.weapons")
+local M = {}
+local BULLET_HINTS = { "tracer", "bullet", "arrow", "bolt", "nail", "pellet", "slug", "rocket", "projectile" }
+local DEBRIS_HINTS = { "gib", "casing", "fire", "impact", "explosion", "spark", "smoke", "flash", "muzzle", "shell" }
+local NEAR_CAMERA = 14
+local MERGE_MS = 35
+local FALLBACK_MS = 160
+local MAX_RANGE = 3000
+local HEAD_RADIUS = 1.3
+local MAGIC_START_STUDS = 3     -- a redirected ray starting further than this from your camera
+local LMB = 0x01
+local queues = {}
+local seen = {}
+local seeded = false
+local pending = nil
+local last_shot = -1e9
+local lmb_was = false
+local sqrt = math.sqrt
+local function now_ms()
+    local fn = utility and (utility.get_tick_count or utility.GetTickCount)
+    if type(fn) ~= "function" then return 0 end
+    local ok, v = pcall(fn)
+    return ok and tonumber(v) or 0
+end
+local function key_down(vk)
+    local fn = input and (input.is_key_down or input.IsKeyDown)
+    if type(fn) ~= "function" then return false end
+    local ok, v = pcall(fn, vk)
+    return ok and v == true
+end
+local function get(inst, field)
+    local ok, v = pcall(function() return inst[field] end)
+    if ok then return v end
+    return nil
+end
+local function kids(inst)
+    if not inst then return {} end
+    local ok, t = pcall(function() return inst:GetChildren() end)
+    return ok and type(t) == "table" and t or {}
+end
+local function find(inst, name)
+    if not inst then return nil end
+    local ok, c = pcall(function() return inst:FindFirstChild(name) end)
+    return ok and c or nil
+end
+local function xyz(v)
+    if v == nil then return nil end
+    local ok, x, y, z = pcall(function() return v.X or v.x, v.Y or v.y, v.Z or v.z end)
+    if ok and type(x) == "number" then return x, y, z end
+    return nil
+end
+local function pos_of(inst)
+    local x, y, z = xyz(get(inst, "Position"))
+    if x then return x, y, z end
+    local cf = get(inst, "CFrame")
+    if cf then
+        x, y, z = xyz(get(cf, "Position"))
+        if x then return x, y, z end
+    end
+    local pp = get(inst, "PrimaryPart")
+    if pp then return xyz(get(pp, "Position")) end
+    return nil
+end
+local function addr(inst)
+    local a = get(inst, "Address")
+    return a and tostring(a) or tostring(inst)
+end
+local function has_hint(name, list)
+    for _, h in ipairs(list) do
+        if name:find(h, 1, true) then return true end
+    end
+    return false
+end
+local function looks_bullet(name)
+    local n = tostring(name or ""):lower()
+    if n == "" or has_hint(n, DEBRIS_HINTS) then return false end
+    return has_hint(n, BULLET_HINTS)
+end
+local function camera_pos()
+    local ok, p = pcall(function() return (camera.get_position or camera.GetPosition)() end)
+    if not ok then return nil end
+    local x, y, z = xyz(p)
+    if x then return { x = x, y = y, z = z } end
+    return nil
+end
+local function camera_look()
+    local ok, p = pcall(function() return (camera.get_look_vector or camera.GetLookVector)() end)
+    if not ok then return nil end
+    local x, y, z = xyz(p)
+    if x then return { x = x, y = y, z = z } end
+    return nil
+end
+local function menu_open()
+    local ok, ui = pcall(function() return April.require("ui.custom_menu") end)
+    return ok and ui and ui.is_open and ui.is_open() == true
+end
+local function vfx_folders()
+    local ws = env.get_workspace()
+    local vfx = ws and find(ws, "VFX")
+    if not vfx then return {} end
+    local list = { vfx }
+    for _, c in ipairs(kids(vfx)) do
+        local cn = get(c, "ClassName")
+        if cn == "Folder" or cn == "Model" then list[#list + 1] = c end
+    end
+    return list
+end
+-- A bullet effect that just appeared beside the camera, or a pooled one that just jumped
+-- there from far away, means you fired.
+function M.scan_vfx(cam)
+    local fired = false
+    local fresh = {}
+    for _, folder in ipairs(vfx_folders()) do
+        for _, c in ipairs(kids(folder)) do
+            if looks_bullet(get(c, "Name")) then
+                local x, y, z = pos_of(c)
+                if x then
+                    local key = addr(c)
+                    local dx, dy, dz = x - cam.x, y - cam.y, z - cam.z
+                    if seeded and dx * dx + dy * dy + dz * dz <= NEAR_CAMERA * NEAR_CAMERA then
+                        local prev = seen[key]
+                        if not prev then
+                            fired = true
+                        else
+                            local px, py, pz = prev[1] - x, prev[2] - y, prev[3] - z
+                            if px * px + py * py + pz * pz > (NEAR_CAMERA * 3) ^ 2 then fired = true end
+                        end
+                    end
+                    fresh[key] = { x, y, z }
+                end
+            end
+        end
+    end
+    seen = fresh
+    seeded = true
+    return fired
+end
+-- The character a hit part belongs to (a model with a HumanoidRootPart or Humanoid that is not
+-- yours), or nil.
+local function character_of(inst)
+    if not inst then return nil end
+    local me = nil
+    pcall(function() me = game.LocalPlayer.Character end)
+    local cur = inst
+    for _ = 1, 6 do
+        cur = get(cur, "Parent")
+        if not cur then return nil end
+        if me and cur == me then return nil end
+        if get(cur, "ClassName") == "Model" and (find(cur, "HumanoidRootPart") or find(cur, "Humanoid")) then
+            return cur
+        end
+    end
+    return nil
+end
+local function cast(ax, ay, az, bx, by, bz)
+    local fn = raycast and (raycast.Cast or raycast.cast)
+    if type(fn) ~= "function" or not (Vector3 and Vector3.New) then return nil end
+    local ok, hit, hpos, _, hinst = pcall(fn, Vector3.New(ax, ay, az), Vector3.New(bx, by, bz))
+    if not ok or not hit then return nil end
+    local x, y, z = xyz(hpos)
+    if not x then return nil end
+    return x, y, z, hinst
+end
+local function is_head(model, part_name, x, y, z)
+    if part_name == "Head" then return true end
+    local head = find(model, "Head")
+    local hx, hy, hz = xyz(head and get(head, "Position"))
+    if not hx then return false end
+    local dx, dy, dz = x - hx, y - hy, z - hz
+    return dx * dx + dy * dy + dz * dz <= HEAD_RADIUS * HEAD_RADIUS
+end
+-- Camera, aim direction and gun position at the moment of the shot.
+function M.capture()
+    local cam = camera_pos()
+    if not cam then return nil end
+    local muzzle = nil
+    pcall(function() muzzle = April.require("game.combat_origin").get_muzzle_origin() end)
+    local dir, owner, meta, origin = silent_hook.current_dir(150)
+    if dir then
+        return { cam = cam, dir = dir, redirected = true, owner = owner, meta = meta, muzzle = muzzle, origin = origin }
+    end
+    local look = camera_look()
+    if not look then return nil end
+    return { cam = cam, dir = look, redirected = false, muzzle = muzzle }
+end
+-- Where a captured shot went: end point, whether it ended on a character, which one, the part
+-- and whether that was the head.
+function M.resolve(shot, t)
+    if not shot then return nil end
+    local cam, dir = shot.cam, shot.dir
+    local len = sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z)
+    if len < 1e-6 then return nil end
+    local ux, uy, uz = dir.x / len, dir.y / len, dir.z / len
+    local ex, ey, ez, model, part, hit
+    local o = shot.origin
+    local from_cam = 0
+    if o and o.x then
+        local ox, oy, oz = o.x - cam.x, o.y - cam.y, o.z - cam.z
+        from_cam = sqrt(ox * ox + oy * oy + oz * oz)
+    end
+    if shot.redirected and from_cam > MAGIC_START_STUDS then
+        -- magic bullet: the ray starts beside the target and lands on the first thing along it,
+        -- the target the ragebot checked is in plain sight from you
+        local meta = shot.meta or {}
+        local tx, ty, tz = o.x + dir.x, o.y + dir.y, o.z + dir.z
+        local hx, hy, hz = cast(o.x, o.y, o.z, tx, ty, tz)
+        if hx then
+            ex, ey, ez = hx, hy, hz
+        elseif type(meta.aim) == "table" and meta.aim.x then
+            ex, ey, ez = meta.aim.x, meta.aim.y, meta.aim.z
+        else
+            ex, ey, ez = tx, ty, tz
+        end
+        model, part, hit = meta.model, meta.part, true
+    elseif shot.redirected then
+        -- sent at a target the hook already checked is reachable; a wall in front still wins
+        ex, ey, ez = cam.x + dir.x, cam.y + dir.y, cam.z + dir.z
+        local meta = shot.meta or {}
+        model, part, hit = meta.model, meta.part, true
+        local hx, hy, hz, hinst = cast(cam.x, cam.y, cam.z, ex, ey, ez)
+        if hx then
+            local dx, dy, dz = hx - cam.x, hy - cam.y, hz - cam.z
+            if sqrt(dx * dx + dy * dy + dz * dz) < len - 2 then
+                ex, ey, ez = hx, hy, hz
+                model = character_of(hinst)
+                part = model and get(hinst, "Name") or nil
+                hit = model ~= nil
+            end
+        end
+    else
+        ex, ey, ez = cam.x + ux * MAX_RANGE, cam.y + uy * MAX_RANGE, cam.z + uz * MAX_RANGE
+        local hx, hy, hz, hinst = cast(cam.x, cam.y, cam.z, ex, ey, ez)
+        if hx then
+            ex, ey, ez = hx, hy, hz
+            model = character_of(hinst)
+            part = model and get(hinst, "Name") or nil
+        end
+        hit = model ~= nil
+    end
+    local head = false
+    if hit then
+        if model then head = is_head(model, part, ex, ey, ez) else head = part == "Head" end
+    end
+    return {
+        t = t, cam = cam, muzzle = shot.muzzle, redirected = shot.redirected == true,
+        ex = ex, ey = ey, ez = ez, hit = hit, model = model, part = part, head = head,
+    }
+end
+function M.subscribe(id)
+    if not queues[id] then queues[id] = {} end
+end
+function M.unsubscribe(id)
+    queues[id] = nil
+    if next(queues) == nil then
+        seen, seeded, pending = {}, false, nil
+    end
+end
+function M.take(id)
+    local q = queues[id]
+    if not q or #q == 0 then return {} end
+    queues[id] = {}
+    return q
+end
+local function publish(r)
+    if not r then return end
+    for _, q in pairs(queues) do q[#q + 1] = r end
+end
+-- Safe to call from every subscriber each frame: the second call in a frame finds nothing new.
+function M.poll()
+    if next(queues) == nil then return end
+    local now = now_ms()
+    local cam = camera_pos()
+    if not cam or menu_open() then return end
+    local fired = M.scan_vfx(cam)
+    local lmb = key_down(LMB)
+    if fired then
+        if now - last_shot >= MERGE_MS then
+            publish(M.resolve(M.capture(), now))
+            last_shot = now
+        end
+        pending = nil
+    elseif lmb and not lmb_was and weapons.cached_held_ranged() then
+        -- remember where the click went in case no bullet effect turns up
+        pending = { t = now, shot = M.capture() }
+    end
+    if pending and now - pending.t >= FALLBACK_MS then
+        if last_shot < pending.t then
+            publish(M.resolve(pending.shot, pending.t))
+            last_shot = now
+        end
+        pending = nil
+    end
+    lmb_was = lmb
+end
+return M
+end)()
+
+April._mods["features.visuals.bullet_tracers"] = (function()
+-- Bullet tracers for your own shots (found by game.shots), drawn on the overlay so they always
+-- show through walls.
+local settings = April.require("core.settings")
+local shots = April.require("game.shots")
+local M = {}
+local P = "april_btracer_enabled"
+local SUB = "tracers"
+M.STYLES = { "Neon", "Laser", "Smooth", "Lightning", "Dashed", "Pulse" }
+M.IMPACTS = { "None", "Dot", "Ring", "Cross", "Box" }
+local SAMPLES = 24
+local tracers = {}
+local sqrt, floor = math.sqrt, math.floor
+local function now_ms()
+    local fn = utility and (utility.get_tick_count or utility.GetTickCount)
+    if type(fn) ~= "function" then return 0 end
+    local ok, v = pcall(fn)
+    return ok and tonumber(v) or 0
+end
+function M.add(r)
+    if not r then return nil end
+    if settings.bool("april_btracer_hits_only", false) and not r.hit then return nil end
+    local origin = r.cam
+    if settings.num("april_btracer_origin", 0) == 0 and type(r.muzzle) == "table" and r.muzzle.x then
+        origin = r.muzzle
+    end
+    local tr = {
+        t = r.t, hit = r.hit, seed = math.random() * 1000,
+        sx = origin.x, sy = origin.y, sz = origin.z, ex = r.ex, ey = r.ey, ez = r.ez,
+    }
+    tracers[#tracers + 1] = tr
+    local max = math.max(1, floor(settings.num("april_btracer_max", 30)))
+    while #tracers > max do table.remove(tracers, 1) end
+    return tr
+end
+function M.list()
+    return tracers
+end
+function M.clear()
+    tracers = {}
+end
+-- ---------------------------------------------------------------- drawing
+local function w2s_fn()
+    -- the same true-camera projection as ESP
+    return function(x, y, z) return April.require("core.esp_util").w2s(x, y, z) end
+end
+local function line(x1, y1, x2, y2, col, th)
+    local fn = draw and (draw.line or draw.Line)
+    if fn then pcall(fn, x1, y1, x2, y2, col, th) end
+end
+local function with_alpha(c, a)
+    return { c[1], c[2], c[3], (c[4] or 1) * a }
+end
+local function mix_white(c, t)
+    return { c[1] + (1 - c[1]) * t, c[2] + (1 - c[2]) * t, c[3] + (1 - c[3]) * t, c[4] or 1 }
+end
+local function hue(h)
+    h = h % 1
+    local i = floor(h * 6)
+    local f = h * 6 - i
+    local q, t = 1 - f, f
+    local r, g, b
+    if i == 0 then r, g, b = 1, t, 0 elseif i == 1 then r, g, b = q, 1, 0
+    elseif i == 2 then r, g, b = 0, 1, t elseif i == 3 then r, g, b = 0, q, 1
+    elseif i == 4 then r, g, b = t, 0, 1 else r, g, b = 1, 0, q end
+    return { r, g, b, 1 }
+end
+local function rand01(seed, i, bucket)
+    local v = math.sin(seed * 12.9898 + i * 78.233 + bucket * 37.719) * 43758.5453
+    return v - floor(v)
+end
+-- The 3D line is sampled and projected; parts behind the camera are dropped, so each run is
+-- a piece that is on screen. A line with both ends in front of the camera stays straight on
+-- screen, so plain styles draw it as one segment.
+local function project_runs(tr, w2s, plain)
+    if plain then
+        local ok1, ax, ay, on1 = pcall(w2s, tr.sx, tr.sy, tr.sz)
+        local ok2, bx, by, on2 = pcall(w2s, tr.ex, tr.ey, tr.ez)
+        if ok1 and ok2 and on1 and on2 and ax and bx then
+            return { { { ax, ay, 0, 0 }, { bx, by, 1, SAMPLES } } }
+        end
+    end
+    local runs, cur = {}, nil
+    for i = 0, SAMPLES do
+        local u = i / SAMPLES
+        local x = tr.sx + (tr.ex - tr.sx) * u
+        local y = tr.sy + (tr.ey - tr.sy) * u
+        local z = tr.sz + (tr.ez - tr.sz) * u
+        local ok, px, py, on = pcall(w2s, x, y, z)
+        if ok and on and px then
+            if not cur then
+                cur = {}
+                runs[#runs + 1] = cur
+            end
+            cur[#cur + 1] = { px, py, u, i }
+        else
+            cur = nil
+        end
+    end
+    return runs
+end
+local function glow_layers(p, q, col, th, glow, a)
+    for g = glow, 1, -1 do
+        line(p[1], p[2], q[1], q[2], with_alpha(col, a * 0.10 * (1 - (g - 1) / (glow + 1))), th + g * 2)
+    end
+end
+local STYLE_DRAW = {}
+STYLE_DRAW[1] = function(p, q, col, th, glow, a)
+    glow_layers(p, q, col, th, glow, a)
+    line(p[1], p[2], q[1], q[2], with_alpha(col, a), th)
+    line(p[1], p[2], q[1], q[2], with_alpha(mix_white(col, 0.6), a), math.max(1, th * 0.45))
+end
+STYLE_DRAW[2] = function(p, q, col, th, _glow, a)
+    line(p[1], p[2], q[1], q[2], with_alpha(col, a * 0.18), th + 3)
+    line(p[1], p[2], q[1], q[2], with_alpha(col, a * 0.35), th + 1.5)
+    line(p[1], p[2], q[1], q[2], with_alpha(mix_white(col, 0.75), a), math.max(1, th * 0.6))
+end
+STYLE_DRAW[3] = function(p, q, col, th, _glow, a)
+    line(p[1], p[2], q[1], q[2], with_alpha(col, a), th)
+end
+local function draw_run(run, style, col, th, glow, a, tr, now)
+    if style == 3 then
+        -- Lightning: each point is pushed sideways a little; the zigzag is fixed for each tracer
+        local bucket = 0
+        local pts = {}
+        for i, p in ipairs(run) do
+            local prev, nxt = run[i - 1] or p, run[i + 1] or p
+            local dx, dy = nxt[1] - prev[1], nxt[2] - prev[2]
+            local l = sqrt(dx * dx + dy * dy)
+            local off = 0
+            if i > 1 and i < #run and l > 0 then off = (rand01(tr.seed, p[4], bucket) - 0.5) * 2 * (3 + th * 1.5) end
+            pts[i] = l > 0 and { p[1] - dy / l * off, p[2] + dx / l * off } or { p[1], p[2] }
+        end
+        for i = 2, #pts do STYLE_DRAW[1](pts[i - 1], pts[i], col, th, math.floor(glow * 0.6), a) end
+        return
+    end
+    if style == 4 then
+        -- Dashed: every other sample segment
+        for i = 2, #run do
+            if run[i][4] % 2 == 0 then STYLE_DRAW[3](run[i - 1], run[i], col, th, glow, a) end
+        end
+        return
+    end
+    if style == 5 then
+        -- Pulse: a dim beam with a bright pulse running from the gun to the impact
+        local head = ((now - tr.t) / 700) % 1
+        for i = 2, #run do
+            local u = (run[i - 1][3] + run[i][3]) * 0.5
+            STYLE_DRAW[3](run[i - 1], run[i], col, th, glow, a * 0.35)
+            local d = math.abs(u - head)
+            if d < 0.1 then STYLE_DRAW[1](run[i - 1], run[i], col, th * 1.6, glow, a * (1 - d / 0.1)) end
+        end
+        return
+    end
+    local fn = STYLE_DRAW[style + 1] or STYLE_DRAW[1]
+    for i = 2, #run do fn(run[i - 1], run[i], col, th, glow, a) end
+end
+local function draw_impact(tr, w2s, kind, size, col)
+    if kind == 0 then return end
+    local ok, x, y, on = pcall(w2s, tr.ex, tr.ey, tr.ez)
+    if not ok or not on or not x then return end
+    if kind == 1 then
+        local fn = draw and (draw.circle_filled or draw.CircleFilled)
+        if fn then pcall(fn, x, y, size, col) end
+    elseif kind == 2 then
+        local fn = draw and (draw.circle or draw.Circle)
+        if fn then pcall(fn, x, y, size, col, 20, 1.5) end
+    elseif kind == 3 then
+        line(x - size, y - size, x + size, y + size, col, 1.5)
+        line(x - size, y + size, x + size, y - size, col, 1.5)
+    else
+        local fn = draw and (draw.rect or draw.Rect)
+        if fn then pcall(fn, x - size, y - size, size * 2, size * 2, col, 0, 1.5) end
+    end
+end
+function M.render(now)
+    local w2s = w2s_fn()
+    if type(w2s) ~= "function" then return end
+    local life = math.max(0.05, settings.num("april_btracer_time", 2.5)) * 1000
+    local fade = settings.bool("april_btracer_fade", true)
+    local hits_only = settings.bool("april_btracer_hits_only", false)
+    local style = settings.num("april_btracer_style", 0)
+    local th = math.max(1, settings.num("april_btracer_thickness", 2))
+    local glow = math.max(0, floor(settings.num("april_btracer_glow", 4)))
+    local impact = settings.num("april_btracer_impact", 1)
+    local impact_size = settings.num("april_btracer_impact_size", 5)
+    local rainbow = settings.bool("april_btracer_rainbow", false)
+    local base = settings.color(P, { 0.35, 0.75, 1, 1 })
+    local hit_col = settings.color("april_btracer_hit_color", { 1, 0.3, 0.35, 1 })
+    local keep = {}
+    for i, tr in ipairs(tracers) do
+        local age = now - tr.t
+        if age < life then
+            keep[#keep + 1] = tr
+            if not hits_only or tr.hit then
+                local a = fade and (1 - age / life) or 1
+                local col = tr.hit and hit_col or base
+                if rainbow then col = hue(now / 2000 + i * 0.07) end
+                for _, run in ipairs(project_runs(tr, w2s, style <= 2)) do
+                    draw_run(run, style, col, th, glow, a, tr, now)
+                end
+                draw_impact(tr, w2s, impact, impact_size, with_alpha(col, a))
+            end
+        end
+    end
+    tracers = keep
+end
+function M.update(_dt) end
+function M.draw()
+    if not settings.bool(P, false) then
+        tracers = {}
+        shots.unsubscribe(SUB)
+        return
+    end
+    shots.subscribe(SUB)
+    shots.poll()
+    for _, r in ipairs(shots.take(SUB)) do M.add(r) end
+    M.render(now_ms())
+end
+return M
+end)()
+
+April._mods["features.visuals.esp_chams"] = (function()
+-- Chams for the Player ESP and the NPC ESP.
+--   Engine (like ahook): Vector's chams on the real body parts, with Fill / Wireframe / Fill Glow
+--     / Wireframe Glow and the glow presets.
+--   Overlay: Vector's player chams renderer (Filled / Outline / Glow) in any color and opacity;
+--     NPCs without a Vector entity get the same look from their parts' outlines.
+-- Both follow the ESP they belong to: its on/off switch, its range, the NPC types that are ticked
+-- and, for players, Skip Teammates (the same team check as the ESP). NPC hitbox parts the game
+-- keeps invisible are skipped, since chams can only show on parts that are drawn.
+local settings = April.require("core.settings")
+local env = April.require("core.env")
+local cache = April.require("core.cache")
+local gpu_chams = April.require("core.gpu_chams")
+local esp_scan = April.require("game.esp_scan")
+local M = {}
+local NPC_PART_CAP = 80
+local DEFAULT_T_OFFSET = 280
+local SPECS = {
+    player = { esp = "april_player_enabled", id = "april_player_chams", range = "april_player_range",
+        owner = "player_chams", default_preset = 1, default_color = { 1, 0.25, 0.25, 0.5 } },
+    npc = { esp = "april_npc_enabled", id = "april_npc_chams", range = "april_npc_range",
+        owner = "npc_chams", default_preset = 3, default_color = { 1, 0.75, 0.2, 0.5 } },
+}
+local NPC_TYPE_IDS = {
+    soldier = "april_npc_soldier", bruno = "april_npc_bruno", boris = "april_npc_boris",
+    brutus = "april_npc_brutus", heli = "april_npc_attack_heli", btr = "april_npc_btr",
+    diver_dave = "april_npc_diver_dave", pilot_pete = "april_npc_pilot_pete",
+    sleeper = "april_npc_sleeper", zombie = "april_npc_zombie",
+}
+local function xyz(v)
+    if v == nil then return nil end
+    local ok, x, y, z = pcall(function() return v.X or v.x, v.Y or v.y, v.Z or v.z end)
+    if ok and type(x) == "number" then return x, y, z end
+    return nil
+end
+local function get(obj, a, b)
+    local ok, v = pcall(function() return obj[a] end)
+    if ok and v ~= nil then return v end
+    if b then
+        ok, v = pcall(function() return obj[b] end)
+        if ok then return v end
+    end
+    return nil
+end
+local function on(spec)
+    return settings.enabled(spec.esp) and settings.bool(spec.id, false)
+end
+function M.chams_type(spec)
+    return settings.num(spec.id .. "_type", 0)
+end
+local function my_pos()
+    local me = cache.local_player or env.get_local_player()
+    return xyz(me and get(me, "Position", "position"))
+end
+local function in_range(spec, x, y, z, mx, my, mz)
+    if not mx or not x then return true end
+    local r = settings.num(spec.range, 500)
+    local dx, dy, dz = x - mx, y - my, z - mz
+    return dx * dx + dy * dy + dz * dz <= r * r
+end
+-- ESP players in range, minus teammates when Skip Teammates is on.
+function M.players()
+    local spec = SPECS.player
+    local out = {}
+    local skip_team = settings.bool(spec.id .. "_team", true)
+    local ok_ps, player_state = pcall(April.require, "game.player_state")
+    local mx, my, mz = my_pos()
+    for _, p in ipairs(cache.players or {}) do
+        if get(p, "IsLocal", "is_local") ~= true and get(p, "IsAlive", "is_alive") ~= false then
+            local x, y, z = xyz(get(p, "Position", "position"))
+            if in_range(spec, x, y, z, mx, my, mz) then
+                local mate = skip_team and ok_ps and player_state and not player_state.passes_team_check(p)
+                if not mate then out[#out + 1] = p end
+            end
+        end
+    end
+    return out
+end
+-- NPC ESP entries of ticked types in range (not the pooled ones parked far below the map).
+function M.npcs()
+    local spec = SPECS.npc
+    local out = {}
+    local mx, my, mz = my_pos()
+    for _, e in ipairs(cache.npcs or {}) do
+        local tid = e and NPC_TYPE_IDS[e.kind]
+        if tid and settings.bool(tid, false) and e.inst then
+            local x, y, z = e.lx, e.ly, e.lz
+            if not x and e.root then x, y, z = xyz(get(e.root, "Position", "position")) end
+            if x and y > -1000 and in_range(spec, x, y, z, mx, my, mz) then out[#out + 1] = e end
+        end
+    end
+    return out
+end
+local function transparency(p)
+    local read = memory and (memory.Read or memory.read)
+    local a = tonumber(get(p, "Address"))
+    if type(read) ~= "function" or not a or a <= 0x10000 then return nil end
+    local off = nil
+    pcall(function() off = tonumber(April.require("core.rbx_offsets").base_part("Transparency")) end)
+    if not off or off <= 0 or off > 0x2000 then off = DEFAULT_T_OFFSET end
+    local ok, v = pcall(read, a + off, "float")
+    v = ok and tonumber(v) or nil
+    if v and v >= 0 and v <= 1 then return v end
+    return nil
+end
+-- An NPC's drawn parts (invisible hitbox parts left out), capped for big vehicles.
+function M.npc_parts(e)
+    local out = {}
+    gpu_chams.for_each_part(e.inst, function(p)
+        if #out >= NPC_PART_CAP then return end
+        local t = transparency(p)
+        if t and t >= 0.99 then return end
+        out[#out + 1] = p
+    end)
+    return out
+end
+-- ---------------------------------------------------------------- engine chams
+local function engine_style(spec)
+    return gpu_chams.mode_index(spec.id .. "_mode", 2), gpu_chams.color_index(spec.id .. "_preset", spec.default_preset)
+end
+local function engine_active(spec)
+    return on(spec) and M.chams_type(spec) == 0 and gpu_chams.available()
+end
+gpu_chams.register_owner(SPECS.player.owner, {
+    rescan_ms = 500,
+    is_active = function() return engine_active(SPECS.player) end,
+    style = function() return engine_style(SPECS.player) end,
+    collect = function(into)
+        for _, p in ipairs(M.players()) do
+            local char = get(p, "Character", "character")
+            if char then gpu_chams.cham_player_character(char, into) end
+        end
+    end,
+})
+gpu_chams.register_owner(SPECS.npc.owner, {
+    rescan_ms = 500,
+    is_active = function() return engine_active(SPECS.npc) end,
+    style = function() return engine_style(SPECS.npc) end,
+    collect = function(into)
+        for _, e in ipairs(M.npcs()) do
+            for _, p in ipairs(M.npc_parts(e)) do gpu_chams.cham_part(p, into) end
+        end
+    end,
+})
+local last_style = {}
+function M.update(_dt)
+    if not gpu_chams.available() then return end
+    for key, spec in pairs(SPECS) do
+        if engine_active(spec) then
+            local mode, color = engine_style(spec)
+            local prev = last_style[key]
+            if prev and (prev[1] ~= mode or prev[2] ~= color) then gpu_chams.refresh_owner_style(spec.owner) end
+            last_style[key] = { mode, color }
+        else
+            last_style[key] = nil
+        end
+        gpu_chams.sync_owner(spec.owner)
+    end
+end
+-- ---------------------------------------------------------------- overlay chams
+local function w2s_fn()
+    -- the same true-camera projection as ESP
+    return function(x, y, z) return April.require("core.esp_util").w2s(x, y, z) end
+end
+local function part_hull(p, w2s)
+    local b = esp_scan.read_part_box(p)
+    if not b then return nil end
+    local pts = {}
+    for sx = -1, 1, 2 do
+        for sy = -1, 1, 2 do
+            for sz = -1, 1, 2 do
+                local x = b.x + b.rx * b.hx * sx + b.ux * b.hy * sy + b.lx * b.hz * sz
+                local y = b.y + b.ry * b.hx * sx + b.uy * b.hy * sy + b.ly * b.hz * sz
+                local z = b.z + b.rz * b.hx * sx + b.uz * b.hy * sy + b.lz * b.hz * sz
+                local ok, px, py, vis = pcall(w2s, x, y, z)
+                if ok and vis and type(px) == "number" then pts[#pts + 1] = { px, py } end
+            end
+        end
+    end
+    if #pts < 3 then return nil end
+    local ch = draw and (draw.ComputeHull or draw.compute_hull)
+    if type(ch) ~= "function" then return nil end
+    local ok, h = pcall(ch, pts)
+    if ok and type(h) == "table" and #h >= 3 then return h end
+    return nil
+end
+local function overlay_color(spec)
+    return settings.color(spec.id .. "_color", spec.default_color)
+end
+function M.draw()
+    local chams_player = draw and (draw.ChamsPlayer or draw.chams_player)
+    local spec = SPECS.player
+    if on(spec) and M.chams_type(spec) == 1 and type(chams_player) == "function" then
+        local col, style = overlay_color(spec), settings.num(spec.id .. "_style", 0)
+        for _, p in ipairs(M.players()) do pcall(chams_player, p, col, style) end
+    end
+    spec = SPECS.npc
+    if on(spec) and M.chams_type(spec) == 1 then
+        local col, style = overlay_color(spec), settings.num(spec.id .. "_style", 0)
+        local chams = draw and (draw.Chams or draw.chams)
+        local w2s = w2s_fn()
+        for _, e in ipairs(M.npcs()) do
+            if e.entity and type(chams_player) == "function" then
+                pcall(chams_player, e.entity, col, style)
+            elseif type(chams) == "function" and type(w2s) == "function" then
+                local hulls = {}
+                for _, p in ipairs(M.npc_parts(e)) do
+                    local h = part_hull(p, w2s)
+                    if h then hulls[#hulls + 1] = h end
+                end
+                if #hulls > 0 then pcall(chams, hulls, col, style) end
+            end
+        end
+    end
+end
+return M
+end)()
+
+April._mods["core.audio"] = (function()
+-- Hitsound playback with nothing outside Vector: Windows' own PlaySound (winmm.dll) and the folder
+-- listing (FindFirstFile) are called through Lua's FFI, inside Vector. No PowerShell or any other
+-- program is ever started and no file is ever created: each user puts their own .wav files in
+-- April_configs\hitsounds\headshot and April_configs\hitsounds\hit. Without FFI in Vector
+-- there is no way to play a sound, so Hitsounds stays silent (the menu says so).
+local config_store = April.require("core.config_store")
+local M = {}
+M.KINDS = { headshot = "headshot", hit = "hit" }
+local SND_ASYNC, SND_NODEFAULT, SND_FILENAME = 0x0001, 0x0002, 0x00020000
+local api = nil
+local lists = {}
+-- Plain global lookups only: Vector's Lua has no rawget, and calling it emptied the MISC tab.
+local function get_ffi()
+    local ok, f = pcall(function() return ffi end)
+    if ok and type(f) == "table" and type(f.cdef) == "function" then return f end
+    local ok_r, req = pcall(function() return require end)
+    if ok_r and type(req) == "function" then
+        local ok_m, m = pcall(req, "ffi")
+        if ok_m and type(m) == "table" and type(m.cdef) == "function" then return m end
+    end
+    return nil
+end
+local function load_api()
+    if api ~= nil then return api or nil end
+    api = false
+    local ok_f, ffi = pcall(get_ffi)
+    if not ok_f or not ffi then return nil end
+    -- a second load of the script finds these already declared; that error is harmless
+    pcall(ffi.cdef, [[
+        typedef struct { unsigned int dwFileAttributes; unsigned int ftCreationTime[2];
+            unsigned int ftLastAccessTime[2]; unsigned int ftLastWriteTime[2];
+            unsigned int nFileSizeHigh; unsigned int nFileSizeLow; unsigned int dwReserved0;
+            unsigned int dwReserved1; char cFileName[260]; char cAlternateFileName[14]; } april_find_data;
+        int PlaySoundA(const char *pszSound, void *hmod, unsigned int fdwSound);
+        void *FindFirstFileA(const char *lpFileName, april_find_data *lpFindFileData);
+        int FindNextFileA(void *hFindFile, april_find_data *lpFindFileData);
+        int FindClose(void *hFindFile);
+    ]])
+    local ok, winmm = pcall(ffi.load, "winmm")
+    if not ok or not winmm then return nil end
+    api = { ffi = ffi, winmm = winmm, k32 = ffi.C }
+    return api
+end
+function M.available()
+    return load_api() ~= nil
+end
+function M.folder(kind)
+    local base = nil
+    pcall(function() base = config_store.configs_dir() end)
+    if not base or base == "" then return nil end
+    return base .. "\\hitsounds\\" .. (M.KINDS[kind] or "hit")
+end
+-- The .wav files in a kind's folder (names without ".wav"), sorted; read once, M.refresh() re-reads.
+function M.list(kind)
+    if lists[kind] then return lists[kind] end
+    local out = {}
+    local a, dir = load_api(), M.folder(kind)
+    if a and dir then
+        pcall(function()
+            local data = a.ffi.new("april_find_data")
+            local h = a.k32.FindFirstFileA(dir .. "\\*.wav", data)
+            if h ~= nil and a.ffi.cast("intptr_t", h) ~= -1 then
+                repeat
+                    local name = a.ffi.string(data.cFileName)
+                    if name:lower():sub(-4) == ".wav" then out[#out + 1] = name:sub(1, -5) end
+                until a.k32.FindNextFileA(h, data) == 0
+                a.k32.FindClose(h)
+            end
+        end)
+    end
+    table.sort(out, function(x, y) return x:lower() < y:lower() end)
+    lists[kind] = out
+    return out
+end
+function M.refresh()
+    lists = {}
+end
+function M.labels(kind)
+    local l = M.list(kind)
+    if #l == 0 then return { "(no .wav files)" } end
+    return l
+end
+function M.default_index(kind, preferred)
+    for i, n in ipairs(M.list(kind)) do
+        if n:lower() == preferred:lower() then return i - 1 end
+    end
+    return 0
+end
+function M.path(kind, name)
+    local dir = M.folder(kind)
+    if not dir or not name then return nil end
+    return dir .. "\\" .. name .. ".wav"
+end
+function M.play(path)
+    local a = load_api()
+    if not a or not path then return false end
+    local ok, r = pcall(a.winmm.PlaySoundA, path, nil, SND_ASYNC + SND_NODEFAULT + SND_FILENAME)
+    return ok and r ~= 0
+end
+return M
+end)()
+
+April._mods["features.visuals.hitsounds"] = (function()
+-- Hitsounds: one of your own .wav files when a shot hits, one folder for headshots and one for
+-- everything else (core.audio plays them inside Vector).
+-- Shots come from game.shots. With Only When Damage Lands on (the default) a hit on a player only
+-- plays once that player's health actually drops, so misses and blocked shots stay silent; NPC
+-- rigs have no health to watch, so their hits play right away.
+local settings = April.require("core.settings")
+local menu_util = April.require("core.menu_util")
+local audio = April.require("core.audio")
+local shots = April.require("game.shots")
+local M = {}
+local P = "april_hitsound_enabled"
+local SUB = "hitsounds"
+local CONFIRM_MS = 700
+local pending = {}
+local function now_ms()
+    local fn = utility and (utility.get_tick_count or utility.GetTickCount)
+    if type(fn) ~= "function" then return 0 end
+    local ok, v = pcall(fn)
+    return ok and tonumber(v) or 0
+end
+local function find(inst, name)
+    if not inst then return nil end
+    local ok, c = pcall(function() return inst:FindFirstChild(name) end)
+    return ok and c or nil
+end
+local function health_of(hum)
+    local ok, v = pcall(function() return hum.Health end)
+    return ok and tonumber(v) or nil
+end
+-- The chosen file for a headshot or a normal hit, or nil when that folder has no .wav files.
+function M.sound_path(head)
+    local kind = head and "headshot" or "hit"
+    local list = audio.list(kind)
+    if #list == 0 then return nil end
+    local id = head and "april_hitsound_head" or "april_hitsound_body"
+    local idx = settings.combo_index(id, list, audio.default_index(kind, head and "Rust Headshot" or "Rust Hit"))
+    return audio.path(kind, list[idx + 1] or list[1])
+end
+function M.play(head)
+    return audio.play(M.sound_path(head))
+end
+function M.on_shot(r, now)
+    if not r or not r.hit then return end
+    local hum = r.model and find(r.model, "Humanoid")
+    if hum and settings.bool("april_hitsound_confirm", true) then
+        local hp = health_of(hum)
+        if hp then
+            pending[#pending + 1] = { t = now, hum = hum, hp = hp, head = r.head }
+            return
+        end
+    end
+    if not hum and not settings.bool("april_hitsound_npcs", true) then return end
+    M.play(r.head)
+end
+-- One drop in health answers one waiting shot; other shots on the same player then compare
+-- against the new health, so one hit never plays twice.
+function M.check_pending(now)
+    local keep = {}
+    for _, p in ipairs(pending) do
+        if now - p.t <= CONFIRM_MS then
+            local hp = health_of(p.hum)
+            if hp and hp < p.hp - 0.01 then
+                M.play(p.head)
+                for _, q in ipairs(pending) do
+                    if q ~= p and q.hum == p.hum and q.hp > hp then q.hp = hp end
+                end
+            else
+                keep[#keep + 1] = p
+            end
+        end
+    end
+    pending = keep
+end
+function M.pending_count()
+    return #pending
+end
+function M.register_menu()
+    local G = menu_util.G
+    local T = menu_util.group(G.MISC)
+    menu.add_button(T, G.MISC, "april_hitsound_test_head", "Test Headshot Sound", function() M.play(true) end)
+    menu.add_button(T, G.MISC, "april_hitsound_test_body", "Test Hit Sound", function() M.play(false) end)
+    menu.add_button(T, G.MISC, "april_hitsound_refresh", "Refresh Sound List", function()
+        audio.refresh()
+        local ok, catalog = pcall(April.require, "ui.catalog")
+        if ok and catalog and catalog.invalidate then catalog.invalidate() end
+    end)
+end
+function M.update(_dt) end
+function M.draw()
+    if not settings.bool(P, false) then
+        pending = {}
+        shots.unsubscribe(SUB)
+        return
+    end
+    shots.subscribe(SUB)
+    shots.poll()
+    local now = now_ms()
+    for _, r in ipairs(shots.take(SUB)) do M.on_shot(r, now) end
+    M.check_pending(now)
+end
+return M
+end)()
+
+April._mods["features.combat.aimbot"] = (function()
+-- Port of the aimbot from "Fallen by Kaytee". It is a camera aimbot: it turns the
+-- camera onto the target with camera.look_at, so the shots you fire match where you
+-- are aiming. NPC targets are Fallen's MilitaryHitbox guard rigs and bosses tracked by
+-- game.npcs (Kaytee's own NPC scan looks in the old Military folder and finds nothing).
+local settings = April.require("core.settings")
+local env = April.require("core.env")
+local cache = April.require("core.cache")
+local draw_util = April.require("core.draw_util")
+local notify = April.require("core.notify")
+local silent_whitelist = April.require("features.combat.silent_whitelist")
+local M = {}
+local sqrt = math.sqrt
+local AIM_BONES = { [0] = "Head", [1] = "UpperTorso", [2] = "LowerTorso" }
+local BONE_CLOSEST, BONE_RANDOM = 3, 4
+local HIT_PARTS = { "Head", "UpperTorso", "LowerTorso" }
+local RAND_IDS = { "april_aimbot_rand_head", "april_aimbot_rand_upper", "april_aimbot_rand_lower" }
+local RAND_DEFAULTS = { 50, 30, 20 }
+local TARGET_PARTS = { "Head", "UpperTorso", "LowerTorso", "HumanoidRootPart" }
+local TOGGLES = {
+    { id = "april_aimbot_players", key_id = "april_aimbot_players_key", mode_id = "april_aimbot_player_mode", label = "AIMBOT PLAYERS" },
+    { id = "april_aimbot_npcs", key_id = "april_aimbot_npcs_key", mode_id = "april_aimbot_npc_mode", label = "AIMBOT NPCS" },
+}
+local TARGET_SCAN_MS = 250
+local locked_target = nil
+-- Humanize state for the current lock: reaction delay, smoothing variance, and an aim
+-- offset inside the bone that re-rolls every few hundred ms.
+local hz = { target = nil, react_until = 0, smooth_mul = 1, next_roll = 0, ox = 0, oy = 0, oz = 0 }
+-- Seed once per load.
+pcall(function()
+    local fn = utility.get_tick_count or utility.GetTickCount
+    math.randomseed(math.floor(tonumber(fn()) or os.time()) % 2147483647)
+end)
+local last_key_states = {}
+local player_targets = {}
+local npc_targets = {}
+local last_target_scan = -TARGET_SCAN_MS
+-- Shared with the old camera aimbot's UI: the whitelist is a skip list (friends etc.).
+local WHITELIST_PREFIX = "april_aim_"
+local wl_mmb_was_down = false
+local function now_ms()
+    local fn = utility and (utility.get_tick_count or utility.GetTickCount)
+    if type(fn) ~= "function" then return 0 end
+    local ok, v = pcall(fn)
+    return ok and (tonumber(v) or 0) or 0
+end
+local function key_down(vk)
+    if not vk or vk <= 0 or not input then return false end
+    local fn = input.is_key_down or input.IsKeyDown
+    if type(fn) ~= "function" then return false end
+    local ok, down = pcall(fn, vk)
+    return ok and down == true
+end
+local function get_key(id)
+    local ok, vk = pcall(function() return April.require("ui.gs_state").get_key(id) end)
+    return ok and tonumber(vk) or 0
+end
+local function find(inst, name)
+    if not inst then return nil end
+    return env.safe_call(function() return inst:FindFirstChild(name) end)
+end
+local function get_distance(x1, y1, z1, x2, y2, z2)
+    local dx, dy, dz = x1 - x2, y1 - y2, z1 - z2
+    return sqrt(dx * dx + dy * dy + dz * dz)
+end
+local function handle_keybind_toggles()
+    local capturing = false
+    pcall(function() capturing = April.require("ui.gs_widgets").listening_key ~= nil end)
+    for i = 1, #TOGGLES do
+        local t = TOGGLES[i]
+        local key = get_key(t.key_id)
+        if key > 0 then
+            local can_toggle = settings.num(t.mode_id, 0) == 0
+            local is_down = key_down(key)
+            if can_toggle and not capturing and is_down and not last_key_states[t.id] then
+                local current = settings.bool(t.id, true)
+                if menu and menu.set then pcall(menu.set, t.id, not current) end
+                settings.invalidate(t.id)
+                pcall(notify.info, t.label .. ": " .. (not current and "ON" or "OFF"), 1500)
+            end
+            last_key_states[t.id] = is_down
+        end
+    end
+end
+local function build_parts(model)
+    local parts = {}
+    for i = 1, #TARGET_PARTS do
+        local p = find(model, TARGET_PARTS[i])
+        if p then parts[TARGET_PARTS[i]] = { part = p } end
+    end
+    -- R6 rigs (zombies) have a single Torso: use it for the UpperTorso/LowerTorso bones.
+    if not parts.UpperTorso or not parts.LowerTorso then
+        local torso = find(model, "Torso")
+        if torso then
+            parts.UpperTorso = parts.UpperTorso or { part = torso }
+            parts.LowerTorso = parts.LowerTorso or { part = torso }
+        end
+    end
+    return parts
+end
+-- Names of players the player ESP's team check counts as teammates (party, TeamHighlight, same
+-- team), so every aimbot skips exactly who the ESP treats as a teammate.
+local function teammate_names()
+    local set = {}
+    local ok, player_state = pcall(April.require, "game.player_state")
+    if not ok or not player_state then return set end
+    for _, p in ipairs(cache.players or {}) do
+        local name = nil
+        pcall(function() name = p.Name or p.name end)
+        if name and not player_state.passes_team_check(p) then set[name] = true end
+    end
+    return set
+end
+local function scan_targets()
+    local players = {}
+    local mates = teammate_names()
+    local lp = game and game.LocalPlayer
+    local service = game and game.Players
+    local ok, list = pcall(function() return service:GetPlayers() end)
+    if not ok or not list then ok, list = pcall(function() return service:GetChildren() end) end
+    for _, player in ipairs((ok and list) or {}) do
+        local is_player = false
+        pcall(function() is_player = player ~= lp and player.ClassName == "Player" end)
+        if is_player then
+            local character = nil
+            pcall(function() character = player.Character end)
+            if character and find(character, "Head") then
+                local pname = nil
+                pcall(function() pname = player.Name end)
+                players[#players + 1] = {
+                    humanoid = find(character, "Humanoid"),
+                    root_part = find(character, "HumanoidRootPart"),
+                    parts = build_parts(character),
+                    obj = character,
+                    player = player,
+                    teammate = pname ~= nil and mates[pname] == true,
+                }
+            end
+        end
+    end
+    player_targets = players
+    local npcs = {}
+    for _, e in ipairs(cache.npcs or {}) do
+        if e.fixed_pos and e.inst then
+            npcs[#npcs + 1] = {
+                humanoid = nil,
+                root_part = find(e.inst, "HumanoidRootPart"),
+                parts = build_parts(e.inst),
+                obj = e.inst,
+                npc = true,
+            }
+        end
+    end
+    npc_targets = npcs
+end
+local function is_target_valid(target)
+    if not target then return false end
+    if target.npc then
+        -- guard rigs have no Humanoid; a rig is live while it is above the y=-5000 pool
+        local root = target.root_part or (target.parts.UpperTorso and target.parts.UpperTorso.part)
+        local ok, y = pcall(function() return root.Position.Y end)
+        return ok and y ~= nil and y > -1000
+    end
+    local health = 0
+    local exists = false
+    pcall(function()
+        if target.humanoid and target.humanoid.Parent then
+            health = target.humanoid.Health
+            exists = true
+        end
+    end)
+    return exists and health > 0
+end
+-- Visible check: cast from the camera to the bone. A hit on the target's own body (or
+-- within 2 studs of the bone) still counts as visible; anything else means a wall or
+-- terrain is in the way. Fails open if the raycast API is unavailable.
+local function is_visible(target, cx, cy, cz, px, py, pz)
+    local rc = raycast
+    if not rc then return true end
+    local cast = rc.Cast or rc.cast
+    if type(cast) == "function" and Vector3 and Vector3.New then
+        local ok, hit, hpos, _, hinst = pcall(cast, Vector3.New(cx, cy, cz), Vector3.New(px, py, pz))
+        if ok then
+            if not hit then return true end
+            if hpos then
+                local dx = (hpos.X or hpos.x or 0) - px
+                local dy = (hpos.Y or hpos.y or 0) - py
+                local dz = (hpos.Z or hpos.z or 0) - pz
+                if dx * dx + dy * dy + dz * dz < 4 then return true end
+            end
+            if hinst and target.obj then
+                local ok2, inside = pcall(function() return hinst:IsDescendantOf(target.obj) end)
+                if ok2 and inside then return true end
+            end
+            return false
+        end
+    end
+    local vis = rc.IsVisible or rc.is_visible
+    if type(vis) == "function" then
+        local ok, v = pcall(vis, cx, cy, cz, px, py, pz)
+        if ok then return v ~= false end
+    end
+    return true
+end
+local function get_local_weapon_stats()
+    local weapons = April.require("game.weapons")
+    local ok, name = pcall(function()
+        return weapons.cached_held_ranged() or weapons.get_held_ranged_weapon_name()
+    end)
+    if not ok or type(name) ~= "string" then return nil end
+    local ok_b, base = pcall(weapons.get_weapon_stats, name)
+    if not ok_b or not base or not (base.from_toolinfo or base.from_fallback or base.from_attributes) then
+        return nil
+    end
+    local ok_e, eff = pcall(April.require("game.combat_stats").get_effective_stats, name)
+    if not ok_e or not eff or not tonumber(eff.speed) then return nil end
+    return { speed = eff.speed, gravity = weapons.drop_gravity(eff.gravity), max_range = weapons.max_range(name) }
+end
+local function text_w(text, size)
+    local fn = draw and (draw.get_text_size or draw.GetTextSize)
+    if type(fn) ~= "function" then return #text * (size or 13) * 0.5 end
+    local ok, w = pcall(fn, text, size)
+    return ok and tonumber(w) or 0
+end
+-- Hit part profiles: the aimbot and silent aim each have their own Target Bone setting and
+-- their own Random percentages.
+-- Random hit part: the three percentage sliders always add up to 100. When you move one,
+-- the other two share what is left in the same ratio they had (evenly if both were 0).
+local function new_profile(combo_id, ids, parts_id)
+    return { combo = combo_id, ids = ids, parts = parts_id, last = nil,
+        state = { bone = nil, target = nil, next_roll = 0, lmb = false } }
+end
+local AIM_PROFILE = new_profile("april_aimbot_bone", RAND_IDS, "april_aimbot_parts")
+M.AIM_PROFILE = AIM_PROFILE
+M.SILENT_PROFILE = new_profile("april_silent_part", {
+    "april_silent_rand_head", "april_silent_rand_upper", "april_silent_rand_lower",
+}, "april_silent_parts")
+M.RAGE_PROFILE = new_profile("april_rage_part", {
+    "april_rage_rand_head", "april_rage_rand_upper", "april_rage_rand_lower",
+}, "april_rage_parts")
+-- Hit Parts: with Closest or Random, only the parts left ticked are ever picked.
+function M.part_allowed(pf, name)
+    if not pf or not pf.parts then return true end
+    for i = 1, #HIT_PARTS do
+        if HIT_PARTS[i] == name then return settings.multi(pf.parts, i, true) == true end
+    end
+    return true
+end
+local function allowed_index(pf)
+    local out = {}
+    for i = 1, #HIT_PARTS do
+        if M.part_allowed(pf, HIT_PARTS[i]) then out[#out + 1] = i end
+    end
+    return out
+end
+local function read_rand(pf)
+    local v = {}
+    for i = 1, 3 do
+        local n = math.floor(settings.num(pf.ids[i], RAND_DEFAULTS[i]) + 0.5)
+        v[i] = math.max(0, math.min(100, n))
+    end
+    return v
+end
+local function write_rand(pf, i, value)
+    if menu and menu.set then pcall(menu.set, pf.ids[i], value) end
+    settings.invalidate(pf.ids[i])
+end
+local function split_rest(rest, pa, pb)
+    if pa + pb <= 0 then
+        local a = math.floor(rest / 2 + 0.5)
+        return a, rest - a
+    end
+    local a = math.floor(rest * pa / (pa + pb) + 0.5)
+    return a, rest - a
+end
+function M.balance_random(pf)
+    pf = pf or AIM_PROFILE
+    local v = read_rand(pf)
+    local prev = pf.last or v
+    local changed = {}
+    for i = 1, 3 do
+        if v[i] ~= prev[i] then changed[#changed + 1] = i end
+    end
+    local out = { v[1], v[2], v[3] }
+    if #changed == 1 then
+        local k = changed[1]
+        local a, b = k % 3 + 1, (k + 1) % 3 + 1
+        out[a], out[b] = split_rest(100 - v[k], prev[a], prev[b])
+    elseif v[1] + v[2] + v[3] ~= 100 then
+        -- loaded config or several moved at once: keep the ratio, fix the total
+        local sum = v[1] + v[2] + v[3]
+        if sum <= 0 then
+            out = { RAND_DEFAULTS[1], RAND_DEFAULTS[2], RAND_DEFAULTS[3] }
+        else
+            out[1] = math.floor(v[1] * 100 / sum + 0.5)
+            out[2], out[3] = split_rest(100 - out[1], v[2], v[3])
+        end
+    end
+    for i = 1, 3 do
+        if out[i] ~= v[i] then write_rand(pf, i, out[i]) end
+    end
+    pf.last = out
+    return out
+end
+-- A part in the Random percentages, among the ticked Hit Parts only (their shares are what is
+-- left of the 100%); nil when every part is unticked.
+local function roll_random_bone(pf)
+    local w = pf.last or read_rand(pf)
+    local allowed = allowed_index(pf)
+    if #allowed == 0 then return nil end
+    local total = 0
+    for _, i in ipairs(allowed) do total = total + w[i] end
+    if total <= 0 then return HIT_PARTS[allowed[math.random(#allowed)]] end
+    local r = math.random() * total
+    for _, i in ipairs(allowed) do
+        if r < w[i] then return HIT_PARTS[i] end
+        r = r - w[i]
+    end
+    return HIT_PARTS[allowed[#allowed]]
+end
+-- New roll for each new target, each click, and every 0.35-0.65s while you hold fire, so an
+-- automatic spray spreads across parts in the chosen percentages.
+local function update_random(current_target, pf)
+    pf = pf or AIM_PROFILE
+    local rs = pf.state
+    local now = now_ms()
+    local lmb = key_down(0x01)
+    if rs.bone == nil or rs.target ~= current_target or not M.part_allowed(pf, rs.bone)
+        or (lmb and not rs.lmb) or (lmb and now >= rs.next_roll) then
+        rs.bone = roll_random_bone(pf)
+        rs.next_roll = now + 350 + math.random() * 300
+    end
+    rs.target = current_target
+    rs.lmb = lmb
+end
+local function part_position(target, name)
+    local pd = target.parts and target.parts[name]
+    if not pd or not pd.part then return nil end
+    local ok, p = pcall(function() return pd.part.Position end)
+    if not ok or not p then return nil end
+    return p.X, p.Y, p.Z
+end
+-- Which part to aim at for this target under the profile's Target Bone setting.
+function M.choose_bone(target, mode, scx, scy, pf)
+    pf = pf or AIM_PROFILE
+    mode = mode or settings.num(pf.combo, 0)
+    if AIM_BONES[mode] then return AIM_BONES[mode] end
+    if mode == BONE_CLOSEST then
+        local w2s = April.require("core.esp_util").w2s
+        if type(w2s) ~= "function" then return "Head" end
+        local best, best_d = nil, math.huge
+        for i = 1, #HIT_PARTS do
+            local x, y, z = nil, nil, nil
+            if M.part_allowed(pf, HIT_PARTS[i]) then x, y, z = part_position(target, HIT_PARTS[i]) end
+            if x then
+                local ok, sx, sy, vis = pcall(w2s, x, y, z)
+                if ok and vis then
+                    local dx, dy = sx - scx, sy - scy
+                    local d = dx * dx + dy * dy
+                    if d < best_d then best, best_d = HIT_PARTS[i], d end
+                end
+            end
+        end
+        if best then return best end
+        local allowed = allowed_index(pf)
+        return allowed[1] and HIT_PARTS[allowed[1]] or nil
+    end
+    local bone = pf.state.bone
+    if bone and M.part_allowed(pf, bone) then return bone end
+    bone = roll_random_bone(pf)
+    pf.state.bone = bone
+    return bone
+end
+-- Everything the aim point needs that is the same for every target this frame.
+function M.make_ctx()
+    local ctx = {
+        prediction = settings.bool("april_aimbot_prediction", true),
+        drop = settings.bool("april_aimbot_drop_prediction", true),
+        speed = settings.num("april_aimbot_bullet_speed", 2100),
+        gravity = settings.num("april_aimbot_gravity", 108),
+        cx = 0, cy = 0, cz = 0,
+    }
+    pcall(function()
+        local pos = (camera.get_position or camera.GetPosition)()
+        ctx.cx, ctx.cy, ctx.cz = pos.X or pos.x, pos.Y or pos.y, pos.Z or pos.z
+    end)
+    if settings.bool("april_aimbot_auto_weapon", true) then
+        local s = get_local_weapon_stats()
+        if s then ctx.speed, ctx.gravity, ctx.max_range = s.speed, s.gravity, s.max_range end
+    end
+    if not ctx.speed or ctx.speed <= 0 then ctx.speed = 2100 end
+    return ctx
+end
+-- Predicted aim point (lead + drop) for one part of one target, or nil.
+function M.aim_point(target, bone, ctx)
+    local aim_part, health = nil, 0
+    if target.humanoid then
+        pcall(function() health = target.humanoid.Health or 0 end)
+    elseif target.parts then
+        health = 100
+    end
+    local part_data = target.parts and target.parts[bone]
+    if part_data and part_data.part then aim_part = part_data.part end
+    if health <= 0 or not aim_part then return nil end
+    local pos = nil
+    pcall(function() pos = aim_part.Position end)
+    if not pos then return nil end
+    local px, py, pz = pos.X, pos.Y, pos.Z
+    if target.npc and py <= -1000 then return nil end
+    local dist_to_target = get_distance(px, py, pz, ctx.cx, ctx.cy, ctx.cz)
+    local aim_x, aim_y, aim_z = px, py, pz
+    local time_to_hit = dist_to_target / ctx.speed
+    -- past the gun's range the bullet never gets there, so aim straight at the target
+    local in_range = not ctx.max_range or dist_to_target <= ctx.max_range
+    if ctx.prediction and in_range then
+        local vel = nil
+        pcall(function()
+            local root = target.root_part or (target.parts and target.parts.HumanoidRootPart and target.parts.HumanoidRootPart.part)
+            local source = root or aim_part
+            if source.AssemblyLinearVelocity then
+                vel = source.AssemblyLinearVelocity
+            elseif source.Velocity then
+                vel = source.Velocity
+            end
+        end)
+        if vel then
+            -- NPC guard rigs teleport between a pool and their live spot each frame, so the
+            -- engine reports a huge bogus velocity on the pop frame. Discard any implausible
+            -- speed (> 500 studs/s) so a teleport spike can't fling the aim point off target.
+            local sp2 = vel.X * vel.X + vel.Y * vel.Y + vel.Z * vel.Z
+            if sp2 <= 250000 then
+                aim_x = px + vel.X * time_to_hit
+                aim_y = py + vel.Y * time_to_hit
+                aim_z = pz + vel.Z * time_to_hit
+            end
+        end
+    end
+    local drop = 0
+    if ctx.drop and in_range then
+        drop = 0.5 * ctx.gravity * (time_to_hit * time_to_hit)
+        aim_y = aim_y + drop
+    end
+    return { x = aim_x, y = aim_y, z = aim_z, rx = px, ry = py, rz = pz, bone = bone, dist = dist_to_target, drop = drop }
+end
+function M.is_visible(target, cx, cy, cz, px, py, pz)
+    return is_visible(target, cx, cy, cz, px, py, pz)
+end
+-- Player and NPC targets are refreshed every 250ms while the aimbot or silent aim needs them.
+function M.ensure_scan()
+    local now = now_ms()
+    if now - last_target_scan >= TARGET_SCAN_MS then
+        last_target_scan = now
+        scan_targets()
+    end
+end
+-- With team_check, players the ESP counts as teammates are left out.
+function M.targets(players, npcs, team_check)
+    local out = {}
+    if npcs then for i = 1, #npc_targets do out[#out + 1] = npc_targets[i] end end
+    if players then
+        for i = 1, #player_targets do
+            local t = player_targets[i]
+            if not (team_check and t.teammate) then out[#out + 1] = t end
+        end
+    end
+    return out
+end
+function M.is_target_valid(target)
+    return is_target_valid(target)
+end
+function M.update_random(current_target, pf)
+    pf = pf or AIM_PROFILE
+    if settings.num(pf.combo, 0) == BONE_RANDOM then update_random(current_target, pf) end
+end
+-- Middle-click on the player nearest the crosshair toggles them in the whitelist
+-- (same interaction the old camera aimbot had).
+local function handle_whitelist_toggle()
+    if not settings.bool("april_aim_whitelist", false) then
+        wl_mmb_was_down = false
+        return
+    end
+    local down = key_down(0x04)
+    local pressed = down and not wl_mmb_was_down
+    wl_mmb_was_down = down
+    if not pressed then return end
+    M.ensure_scan()
+    local sw, sh = draw_util.screen_size()
+    local scx, scy = sw / 2, sh / 2
+    local w2s = April.require("core.esp_util").w2s
+    if type(w2s) ~= "function" then return end
+    local ctx = M.make_ctx()
+    local bone_mode = settings.num("april_aimbot_bone", 0)
+    local fov_radius = settings.num("april_aimbot_fov", 150)
+    local best, best_d = nil, math.huge
+    for i = 1, #player_targets do
+        local t = player_targets[i]
+        local pos = M.aim_point(t, M.choose_bone(t, bone_mode, scx, scy), ctx)
+        if pos then
+            local ok, sx, sy, vis = pcall(w2s, pos.x, pos.y, pos.z)
+            if ok and vis then
+                local dx, dy = sx - scx, sy - scy
+                local d = dx * dx + dy * dy
+                if d < best_d and sqrt(d) < fov_radius then
+                    best, best_d = t, d
+                end
+            end
+        end
+    end
+    if best and best.player then
+        silent_whitelist.toggle_player(best.player, WHITELIST_PREFIX)
+    end
+end
+function M.update(_dt)
+    handle_keybind_toggles()
+    pcall(M.balance_random, AIM_PROFILE)
+    pcall(M.balance_random, M.SILENT_PROFILE)
+    if not settings.bool("april_aimbot_enabled", false) then return end
+    M.ensure_scan()
+    handle_whitelist_toggle()
+end
+function M.draw()
+    if not settings.bool("april_aimbot_enabled", false) then
+        locked_target = nil
+        return
+    end
+    local sw, sh = draw_util.screen_size()
+    local scx, scy = sw / 2, sh / 2
+    local fov_radius = settings.num("april_aimbot_fov", 150)
+    local prediction = settings.bool("april_aimbot_prediction", true)
+    local drop_prediction = settings.bool("april_aimbot_drop_prediction", true)
+    local auto_weapon = settings.bool("april_aimbot_auto_weapon", true)
+    if settings.bool("april_aimbot_draw_fov", true) then
+        draw_util.fill_fov("april_aimbot_fill_fov", scx, scy, fov_radius, { 1, 1, 1, 0.25 })
+        local circle = draw and (draw.circle or draw.Circle)
+        if type(circle) == "function" then
+            pcall(circle, scx, scy, fov_radius, settings.color("april_aimbot_draw_fov", { 1, 1, 1, 1 }), 64)
+        end
+        if prediction or drop_prediction then
+            local indicators = {}
+            if prediction and settings.bool("april_aimbot_prediction_indicator", false) then
+                indicators[#indicators + 1] = { text = "[Movement Prediction]",
+                    color = settings.color("april_aimbot_prediction_indicator", { 0, 1, 1, 1 }) }
+            end
+            if drop_prediction and settings.bool("april_aimbot_drop_prediction_indicator", false) then
+                indicators[#indicators + 1] = { text = "[Drop Calculation]",
+                    color = settings.color("april_aimbot_drop_prediction_indicator", { 1, 0.5, 0, 1 }) }
+            end
+            if auto_weapon and settings.bool("april_aimbot_auto_weapon_indicator", false) then
+                if get_local_weapon_stats() then
+                    indicators[#indicators + 1] = { text = "[Automatic Weapon Calculation]",
+                        color = settings.color("april_aimbot_auto_weapon_indicator", { 1, 1, 1, 1 }) }
+                end
+            end
+            local size = settings.num("april_esp_text_size", 13) - 2
+            local spacing = 5
+            local total_width = 0
+            for i, ind in ipairs(indicators) do
+                total_width = total_width + text_w(ind.text, size) + (i < #indicators and spacing or 0)
+            end
+            local current_x = scx - total_width * 0.5
+            local draw_y = scy + fov_radius + 5
+            for _, ind in ipairs(indicators) do
+                draw_util.text(current_x, draw_y, ind.text, ind.color, size)
+                current_x = current_x + text_w(ind.text, size) + spacing
+            end
+        end
+    end
+    local main_key = get_key("april_aimbot_key")
+    local is_main_down = main_key > 0 and key_down(main_key)
+    local best_fov = fov_radius
+    local best_pos = nil
+    local bone_mode = settings.num("april_aimbot_bone", 0)
+    local targets = {}
+    local n_key = get_key("april_aimbot_npcs_key")
+    local aiming_at_npcs = false
+    if settings.num("april_aimbot_npc_mode", 0) == 1 then
+        aiming_at_npcs = n_key > 0 and key_down(n_key)
+    else
+        aiming_at_npcs = settings.bool("april_aimbot_npcs", true) and is_main_down
+    end
+    if aiming_at_npcs then
+        for i = 1, #npc_targets do targets[#targets + 1] = npc_targets[i] end
+    end
+    local p_key = get_key("april_aimbot_players_key")
+    local aiming_at_players = false
+    if settings.num("april_aimbot_player_mode", 0) == 1 then
+        aiming_at_players = p_key > 0 and key_down(p_key)
+    else
+        aiming_at_players = settings.bool("april_aimbot_players", true) and is_main_down
+    end
+    if aiming_at_players then
+        local team_check = settings.bool("april_aimbot_team_check", true)
+        local wl_on = settings.bool("april_aim_whitelist", false)
+        for i = 1, #player_targets do
+            local t = player_targets[i]
+            if not (team_check and t.teammate)
+                and not (wl_on and silent_whitelist.is_whitelisted(t.player, WHITELIST_PREFIX)) then
+                targets[#targets + 1] = t
+            end
+        end
+    end
+    if not (aiming_at_npcs or aiming_at_players) then
+        locked_target = nil
+        hz.target = nil
+        return
+    end
+    if #targets == 0 then
+        locked_target = nil
+        hz.target = nil
+        return
+    end
+    local ctx = M.make_ctx()
+    local cam_x, cam_y, cam_z = ctx.cx, ctx.cy, ctx.cz
+    if bone_mode == BONE_RANDOM then update_random(locked_target) end
+    local function get_aim_pos(target)
+        return M.aim_point(target, M.choose_bone(target, bone_mode, scx, scy), ctx)
+    end
+    local w2s = April.require("core.esp_util").w2s
+    if type(w2s) ~= "function" then return end
+    local visible_only = settings.bool("april_aimbot_visible_only", false)
+    if settings.bool("april_aimbot_sticky", true) and locked_target then
+        if is_target_valid(locked_target) then
+            local pos = get_aim_pos(locked_target)
+            if pos then
+                local sx, sy, vis = w2s(pos.x, pos.y, pos.z)
+                if vis then
+                    local dx, dy = sx - scx, sy - scy
+                    if sqrt(dx * dx + dy * dy) < fov_radius
+                        and (not visible_only
+                            or is_visible(locked_target, cam_x, cam_y, cam_z, pos.rx, pos.ry, pos.rz))
+                    then
+                        best_pos = pos
+                    else
+                        locked_target = nil
+                    end
+                else
+                    locked_target = nil
+                end
+            else
+                locked_target = nil
+            end
+        else
+            locked_target = nil
+        end
+    end
+    if not best_pos then
+        for i = 1, #targets do
+            local target = targets[i]
+            local pos = get_aim_pos(target)
+            if pos then
+                local sx, sy, vis = w2s(pos.x, pos.y, pos.z)
+                if vis then
+                    local dx, dy = sx - scx, sy - scy
+                    local fov = sqrt(dx * dx + dy * dy)
+                    if fov < best_fov
+                        and (not visible_only
+                            or is_visible(target, cam_x, cam_y, cam_z, pos.rx, pos.ry, pos.rz))
+                    then
+                        best_fov = fov
+                        best_pos = pos
+                        locked_target = target
+                    end
+                end
+            end
+        end
+    end
+    if best_pos then
+        local tsx, tsy, tvis = w2s(best_pos.x, best_pos.y, best_pos.z)
+        if tvis then M._screen_target = { x = tsx, y = tsy, t = now_ms() } end
+        local smooth = settings.num("april_aimbot_smooth", 5)
+        if settings.bool("april_aimbot_humanize", true) then
+            local now = now_ms()
+            if hz.target ~= locked_target then
+                -- new lock: short reaction delay and a per-lock smoothing variance
+                hz.target = locked_target
+                hz.react_until = now + 70 + math.random() * 120
+                hz.smooth_mul = 0.85 + math.random() * 0.5
+                hz.next_roll = 0
+            end
+            if now >= hz.next_roll then
+                hz.next_roll = now + 250 + math.random() * 400
+                local r = best_pos.bone == "Head" and 0.28 or 0.55
+                hz.ox = (math.random() * 2 - 1) * r
+                hz.oy = (math.random() * 2 - 1) * r * 0.8
+                hz.oz = (math.random() * 2 - 1) * r
+            end
+            if now < hz.react_until then return end
+            best_pos = { x = best_pos.x + hz.ox, y = best_pos.y + hz.oy, z = best_pos.z + hz.oz }
+            smooth = math.max(2, smooth * hz.smooth_mul)
+        end
+        local look = camera and (camera.look_at or camera.LookAt)
+        if type(look) == "function" then
+            local ok_r, rcs = pcall(April.require, "features.combat.recoil_control")
+            local pre_p, pre_y = nil, nil
+            if ok_r and rcs then pre_p, pre_y = rcs.angles() end
+            pcall(look, best_pos.x, best_pos.y, best_pos.z, smooth)
+            if ok_r and rcs then rcs.script_move(pre_p, pre_y) end
+        end
+    end
+end
+function M.register_menu()
+    local menu_util = April.require("core.menu_util")
+    menu.add_button(menu_util.TAB, menu_util.G.AIM, "april_aim_whitelist_clear", "Clear Whitelist", function()
+        silent_whitelist.clear(WHITELIST_PREFIX)
+    end)
+end
+return M
+end)()
+
+April._mods["features.combat.silent_aim"] = (function()
+-- Silent aim through Vector's raycast hook: while you hold left click, the game's aim ray
+-- is pointed at the predicted spot on the target (same lead and drop as the aimbot) and the
+-- camera does not move. It only acts while you fire, only on targets inside its FOV and
+-- range, only on visible targets by default, and only on the share of shots set by Hit
+-- Chance. While the ragebot has a target it owns the shot and silent aim stands aside.
+local settings = April.require("core.settings")
+local draw_util = April.require("core.draw_util")
+local silent_hook = April.require("core.silent_hook")
+local M = {}
+local P = "april_silent_aim"
+local OWNER = "silent_aim"
+local LMB = 0x01
+local locked = nil
+local roll = { ok = true, next_at = 0, lmb = false, target = nil }
+local function now_ms()
+    local fn = utility and (utility.get_tick_count or utility.GetTickCount)
+    if type(fn) ~= "function" then return 0 end
+    local ok, v = pcall(fn)
+    return ok and tonumber(v) or 0
+end
+local function key_down(vk)
+    local fn = input and (input.is_key_down or input.IsKeyDown)
+    if type(fn) ~= "function" then return false end
+    local ok, v = pcall(fn, vk)
+    return ok and v == true
+end
+local function menu_open()
+    local ok, ui = pcall(function() return April.require("ui.custom_menu") end)
+    return ok and ui and ui.is_open and ui.is_open() == true
+end
+local function rage_busy()
+    local ok, rage = pcall(April.require, "features.combat.ragebot")
+    return ok and rage and rage.has_target and rage.has_target() == true
+end
+-- One hit-chance roll per click and every 0.12-0.22s while held, so with 70% about 7 in
+-- 10 shots are redirected and the rest go where you actually aimed.
+local function update_roll(target)
+    local now = now_ms()
+    local lmb = key_down(LMB)
+    if roll.target ~= target or (not lmb and roll.lmb) or (lmb and now >= roll.next_at) then
+        local chance = math.max(0, math.min(100, settings.num("april_silent_hit_chance", 70)))
+        roll.ok = math.random() * 100 < chance
+        roll.next_at = now + 120 + math.random() * 100
+    end
+    roll.lmb = lmb
+    roll.target = target
+end
+function M.update(_dt)
+    if settings.bool(P, false) then
+        April.require("features.combat.aimbot").ensure_scan()
+    end
+end
+function M.draw()
+    if not settings.bool(P, false) then
+        locked = nil
+        roll.target = nil
+        roll.next_at = 0
+        M._screen_target = nil
+        silent_hook.release(OWNER)
+        return
+    end
+    if not silent_hook.acquire(OWNER) then return end
+    local aimbot = April.require("features.combat.aimbot")
+    local sw, sh = draw_util.screen_size()
+    local scx, scy = sw * 0.5, sh * 0.5
+    local fov = settings.num("april_silent_fov", 80)
+    if settings.bool("april_silent_draw_fov", false) then
+        draw_util.fill_fov("april_silent_fill_fov", scx, scy, fov, { 1, 0.4, 0.4, 0.25 })
+        local circle = draw and (draw.circle or draw.Circle)
+        if circle then
+            pcall(circle, scx, scy, fov, settings.color("april_silent_draw_fov", { 1, 0.4, 0.4, 0.8 }), 64)
+        end
+    end
+    if menu_open() or rage_busy() then
+        silent_hook.stop(OWNER)
+        return
+    end
+    local w2s = April.require("core.esp_util").w2s
+    if type(w2s) ~= "function" then return end
+    local targets = aimbot.targets(settings.bool("april_silent_players", true), settings.bool("april_silent_npcs", true),
+        settings.bool("april_silent_team_check", true))
+    local max_dist = settings.num("april_silent_max_dist", 300)
+    local visible_only = settings.bool("april_silent_visible_only", true)
+    local pf = aimbot.SILENT_PROFILE
+    local bone_mode = settings.num(pf.combo, 0)
+    aimbot.update_random(locked, pf)
+    local ctx = aimbot.make_ctx()
+    local best, best_d, best_t = nil, fov, nil
+    for i = 1, #targets do
+        local t = targets[i]
+        if aimbot.is_target_valid(t) then
+            local pos = aimbot.aim_point(t, aimbot.choose_bone(t, bone_mode, scx, scy, pf), ctx)
+            if pos and pos.dist <= max_dist then
+                local sx, sy, vis = w2s(pos.x, pos.y, pos.z)
+                if vis then
+                    local dx, dy = sx - scx, sy - scy
+                    local d = math.sqrt(dx * dx + dy * dy)
+                    if d < best_d and (not visible_only
+                        or aimbot.is_visible(t, ctx.cx, ctx.cy, ctx.cz, pos.rx, pos.ry, pos.rz)) then
+                        best, best_d, best_t = pos, d, t
+                        M._screen_target = { x = sx, y = sy, t = now_ms() }
+                    end
+                end
+            end
+        end
+    end
+    locked = best_t
+    update_roll(best_t)
+    if not best or not roll.ok then
+        silent_hook.stop(OWNER)
+        return
+    end
+    silent_hook.track(OWNER, { x = ctx.cx, y = ctx.cy, z = ctx.cz },
+        { x = best.x - ctx.cx, y = best.y - ctx.cy, z = best.z - ctx.cz }, LMB,
+        { part = best.bone, model = best_t and best_t.obj })
+end
+return M
+end)()
+
+April._mods["features.combat.ragebot"] = (function()
+-- Ragebot: every frame it looks for a target part inside its FOV that a shot can really hit (in
+-- plain sight, a clear path from the camera along the bullet's curve, inside the gun's range, not
+-- downed) and that one hit would do at least Min Damage to. The shot goes there by magic bullet:
+-- its ray starts just in front of the part, on that clear line, and runs into it. With Auto Fire it
+-- also pulls the trigger. Hit Part works like the aimbot's Target Bone (same Random percentages);
+-- a hidden or weak part makes it move on to another one.
+local settings = April.require("core.settings")
+local draw_util = April.require("core.draw_util")
+local menu_util = April.require("core.menu_util")
+local silent_hook = April.require("core.silent_hook")
+local weapons = April.require("game.weapons")
+local damage = April.require("game.damage")
+local shots = April.require("game.shots")
+local esp_scan = April.require("game.esp_scan")
+local M = {}
+local P = "april_rage_enabled"
+local P_OVERRIDE = "april_rage_override"
+local OWNER = "ragebot"
+local HIT_PARTS = { "Head", "UpperTorso", "LowerTorso" }
+local PART_LABEL = { Head = "Head", UpperTorso = "Chest", LowerTorso = "Stomach" }
+-- Vector cannot tell which window is in front, and Fallen does not keep the cursor at the
+-- screen center, so Auto Fire only checks that the cursor is over the game and the menu is shut.
+-- Auto Fire clicks every 5-10ms (a new random gap each time) while there is a target, so any gun
+-- fires the moment it is ready, an AK as much as a Barrett; the game ignores clicks while a gun
+-- is cooling down. It clicks at most once per frame. Bows only fire while you hold right click.
+local CLICK_MIN_MS, CLICK_MAX_MS = 5, 10
+local RMB = 0x02
+local LMB = 0x01
+-- Auto Fire's click is over before the hook can see left click held, so for this long after
+-- each click the shot is also pointed every frame, the way a quick tap of left click would be.
+local FIRE_WINDOW_MS = 100
+-- Shots far from the crosshair come back invalid (DESYNC), so the FOV is capped here.
+M.MAX_FOV = 250
+-- Reload When Empty: April sees every bullet leave the gun (game.shots). When Auto Fire keeps
+-- clicking for longer than the gun's cooldown plus DRY_MARGIN_MS and no bullet comes out, the
+-- magazine is empty: R is pressed once and Auto Fire waits RELOAD_WAIT_MS before clicking again.
+-- It only trusts this once it has seen the gun in your hands fire, so a gun whose bullets cannot
+-- be seen is never taken for empty.
+local RELOAD_VK = 0x52
+local DRY_MARGIN_MS = 400
+local RELOAD_WAIT_MS = 1500
+local SUB = "ragebot"
+local state = { pick = nil, fire_until = 0, next_click = 0, last_shot = -1e9, shot_weapon = nil,
+    dry_since = nil, reload_until = 0, reloads = 0 }
+local sqrt = math.sqrt
+local function now_ms()
+    local fn = utility and (utility.get_tick_count or utility.GetTickCount)
+    if type(fn) ~= "function" then return 0 end
+    local ok, v = pcall(fn)
+    return ok and tonumber(v) or 0
+end
+local function menu_open()
+    local ok, ui = pcall(function() return April.require("ui.custom_menu") end)
+    return ok and ui and ui.is_open and ui.is_open() == true
+end
+local function text_w(text, size)
+    local fn = draw and (draw.get_text_size or draw.GetTextSize)
+    if type(fn) ~= "function" then return #text * size * 0.55 end
+    local ok, w = pcall(fn, text, size)
+    return ok and tonumber(w) or #text * size * 0.55
+end
+function M.fov()
+    return math.min(settings.num("april_rage_fov", 125), M.MAX_FOV)
+end
+-- Downed players still have health, but the server rejects hits on them.
+local function is_downed(t)
+    local hum = t and t.humanoid
+    if not hum then return false end
+    local ok, v = pcall(function()
+        if hum.GetAttribute then return hum:GetAttribute("Downed") end
+        return hum:get_attribute("Downed")
+    end)
+    return ok and (v == true or v == 1)
+end
+M.is_downed = is_downed
+function M.min_damage()
+    if settings.enabled(P_OVERRIDE) then
+        return settings.num("april_rage_override_dmg", 10), true
+    end
+    return settings.num("april_rage_min_dmg", 5), false
+end
+function M.has_target()
+    return state.pick ~= nil and settings.enabled(P)
+end
+function M.current()
+    return state.pick
+end
+local BONE_CLOSEST, BONE_RANDOM = 3, 4
+local orders, order_count = {}, 0
+local function addr_of(inst)
+    local ok, a = pcall(function() return tonumber(inst.Address) end)
+    return ok and a or nil
+end
+local function part_screen_d2(t, name, w2s, scx, scy)
+    local pd = t.parts and t.parts[name]
+    local ok, x, y, z = pcall(function() local p = pd.part.Position return p.X, p.Y, p.Z end)
+    if not ok or not x then return math.huge end
+    local ok2, sx, sy, vis = pcall(w2s, x, y, z)
+    if not ok2 or not vis or type(sx) ~= "number" then return math.huge end
+    return (sx - scx) * (sx - scx) + (sy - scy) * (sy - scy)
+end
+local function shuffle(list)
+    for i = #list, 2, -1 do
+        local j = math.random(i)
+        list[i], list[j] = list[j], list[i]
+    end
+    return list
+end
+-- Ragebot hit parts. A limb is aimed at through whichever of its pieces (upper, lower, hand or
+-- foot, or the R6 limb) can be hit; each piece gets its own sight and path check.
+M.GROUPS = {
+    { label = "Head", rand = "april_rage_rand_head", weight = 40, parts = { "Head" } },
+    { label = "Chest", rand = "april_rage_rand_upper", weight = 25, parts = { "UpperTorso", "Torso" } },
+    { label = "Stomach", rand = "april_rage_rand_lower", weight = 15, parts = { "LowerTorso", "Torso" } },
+    { label = "Left Arm", rand = "april_rage_rand_larm", weight = 5,
+        parts = { "LeftUpperArm", "LeftLowerArm", "LeftHand", "Left Arm" } },
+    { label = "Right Arm", rand = "april_rage_rand_rarm", weight = 5,
+        parts = { "RightUpperArm", "RightLowerArm", "RightHand", "Right Arm" } },
+    { label = "Left Leg", rand = "april_rage_rand_lleg", weight = 5,
+        parts = { "LeftUpperLeg", "LeftLowerLeg", "LeftFoot", "Left Leg" } },
+    { label = "Right Leg", rand = "april_rage_rand_rleg", weight = 5,
+        parts = { "RightUpperLeg", "RightLowerLeg", "RightFoot", "Right Leg" } },
+}
+local FIXED_GROUP = { [0] = 1, [1] = 2, [2] = 3 }
+local rolls, roll_count = {}, 0
+function M.reset_roll()
+    rolls, roll_count, orders, order_count = {}, 0, {}, 0
+end
+local function group_allowed(i)
+    return settings.multi("april_rage_parts", i, true) == true
+end
+local function group_weight(i)
+    local g = M.GROUPS[i]
+    return math.max(0, settings.num(g.rand, g.weight))
+end
+-- Random's part sliders always add up to 100% over the ticked parts: moving one shares the rest out
+-- over the other ticked parts by their old values; ticking or unticking a part, or a config that
+-- doesn't add up, scales the ticked parts back to 100.
+local bal_last = nil
+local function share_out(out, idxs, total, weights)
+    if #idxs == 0 then return end
+    local wsum = 0
+    for _, i in ipairs(idxs) do wsum = wsum + math.max(0, weights[i] or 0) end
+    local given, fracs = 0, {}
+    for _, i in ipairs(idxs) do
+        local exact = wsum > 0 and total * math.max(0, weights[i] or 0) / wsum or total / #idxs
+        out[i] = math.floor(exact)
+        given = given + out[i]
+        fracs[#fracs + 1] = { i, exact - out[i] }
+    end
+    table.sort(fracs, function(a, b) return a[2] > b[2] end)
+    local k = 1
+    while given < total and #fracs > 0 do
+        local i = fracs[(k - 1) % #fracs + 1][1]
+        out[i] = out[i] + 1
+        given = given + 1
+        k = k + 1
+    end
+end
+function M.balance_parts()
+    local n = #M.GROUPS
+    local v, ticked, key = {}, {}, {}
+    for i = 1, n do
+        v[i] = math.max(0, math.min(100, math.floor(group_weight(i) + 0.5)))
+        if group_allowed(i) then
+            ticked[#ticked + 1] = i
+            key[i] = "1"
+        else
+            key[i] = "0"
+        end
+    end
+    local tick_key = table.concat(key)
+    local out = {}
+    for i = 1, n do out[i] = v[i] end
+    if #ticked > 0 then
+        local prev = bal_last and bal_last.tick == tick_key and bal_last.v or nil
+        local changed = {}
+        if prev then
+            for _, i in ipairs(ticked) do
+                if v[i] ~= prev[i] then changed[#changed + 1] = i end
+            end
+        end
+        local sum = 0
+        for _, i in ipairs(ticked) do sum = sum + v[i] end
+        if prev and #changed == 1 then
+            local k = changed[1]
+            local others = {}
+            for _, i in ipairs(ticked) do if i ~= k then others[#others + 1] = i end end
+            if #others == 0 then out[k] = 100 else share_out(out, others, 100 - v[k], prev) end
+        elseif sum ~= 100 then
+            share_out(out, ticked, 100, v)
+        end
+        for i = 1, n do
+            if out[i] ~= v[i] then
+                local id = M.GROUPS[i].rand
+                if menu and menu.set then pcall(menu.set, id, out[i]) end
+                pcall(settings.invalidate, id)
+            end
+        end
+    end
+    bal_last = { v = out, tick = tick_key }
+    return out
+end
+-- A part of the target by name. Limbs aren't in the aimbot's part list, so they're looked up once
+-- per target scan and kept with the others.
+local function part_of(t, name)
+    local pd = t.parts and t.parts[name]
+    if pd and pd.part then return pd.part end
+    t._missing = t._missing or {}
+    if t._missing[name] then return nil end
+    local p = nil
+    pcall(function() p = t.obj:FindFirstChild(name) end)
+    if p then
+        t.parts = t.parts or {}
+        t.parts[name] = { part = p }
+    else
+        t._missing[name] = true
+    end
+    return p
+end
+M.part_of = part_of
+-- A shot went at this player: their next shot gets a new roll.
+function M.spend_roll(t)
+    local key = t and (addr_of(t.obj) or t.obj)
+    local r = key ~= nil and rolls[key] or nil
+    if r then r.spent = true end
+end
+-- Random: a part rolled by the ticked parts' weights, a new roll for every shot (M.spend_roll), so
+-- over many shots each part is hit in its percentage. Without shots a roll is kept up to ROLL_MS.
+local ROLL_MS = 2000
+local function roll_group(t)
+    local now = now_ms()
+    local key = addr_of(t.obj) or t.obj
+    local r = key ~= nil and rolls[key] or nil
+    if r and not r.spent and now < r.next_at and r.group and group_allowed(r.group) and group_weight(r.group) > 0 then
+        return r.group
+    end
+    local total, list = 0, {}
+    for i = 1, #M.GROUPS do
+        if group_allowed(i) then
+            local w = group_weight(i)
+            total = total + w
+            list[#list + 1] = { i, w }
+        end
+    end
+    local pick = nil
+    if #list > 0 then
+        if total <= 0 then
+            pick = list[math.random(#list)][1]
+        else
+            local x = math.random() * total
+            for _, e in ipairs(list) do
+                if x < e[2] then pick = e[1]; break end
+                x = x - e[2]
+            end
+            pick = pick or list[#list][1]
+        end
+    end
+    if key ~= nil then
+        if roll_count > 64 then rolls, roll_count = {}, 0 end
+        rolls[key] = { group = pick, next_at = now + ROLL_MS }
+        roll_count = roll_count + 1
+    end
+    return pick
+end
+-- Parts to try on one target, best first. Random: the rolled part, then the other ticked parts in a
+-- random order (kept until the next roll). Closest: the ticked parts by distance to the crosshair.
+-- A fixed Hit Part leads, and the others follow only with Try Other Parts.
+local function groups_to_try(t, bone_mode, scx, scy, w2s)
+    local list = {}
+    if bone_mode == BONE_RANDOM then
+        local first = roll_group(t)
+        if first then list[1] = first end
+        -- a part at 0% is never shot, not even when the rolled part can't be hit
+        local rest = {}
+        for i = 1, #M.GROUPS do
+            if i ~= first and group_allowed(i) and group_weight(i) > 0 then rest[#rest + 1] = i end
+        end
+        local key = addr_of(t.obj) or t.obj
+        local o = key ~= nil and orders[key] or nil
+        if not o or o.first ~= first or #o.rest ~= #rest then
+            if order_count > 64 then orders, order_count = {}, 0 end
+            o = { first = first, rest = shuffle(rest) }
+            if key ~= nil then
+                orders[key] = o
+                order_count = order_count + 1
+            end
+        end
+        for _, i in ipairs(o.rest) do list[#list + 1] = i end
+    elseif bone_mode == BONE_CLOSEST then
+        local d = {}
+        for i = 1, #M.GROUPS do
+            if group_allowed(i) then
+                local best = math.huge
+                if type(w2s) == "function" then
+                    for _, name in ipairs(M.GROUPS[i].parts) do
+                        if part_of(t, name) then
+                            local dd = part_screen_d2(t, name, w2s, scx, scy)
+                            if dd < best then best = dd end
+                        end
+                    end
+                end
+                if best < math.huge then
+                    list[#list + 1] = i
+                    d[i] = best
+                end
+            end
+        end
+        table.sort(list, function(x, y) return d[x] < d[y] end)
+    else
+        local first = FIXED_GROUP[bone_mode] or 1
+        list[1] = first
+        if settings.bool("april_rage_multipoint", true) then
+            for i = 1, #M.GROUPS do
+                if i ~= first then list[#list + 1] = i end
+            end
+        end
+    end
+    return list
+end
+local function belongs_to(inst, t)
+    local model = t.obj
+    if not inst or not model then return false end
+    if type(inst) == "number" then
+        if inst == addr_of(model) then return true end
+        for _, pd in pairs(t.parts or {}) do
+            if pd.part and addr_of(pd.part) == inst then return true end
+        end
+        return false
+    end
+    if inst == model then return true end
+    local ok, inside = pcall(function() return inst:IsDescendantOf(model) end)
+    if ok and inside == true then return true end
+    local ma = addr_of(model)
+    local cur = inst
+    for _ = 1, 10 do
+        local okp, p = pcall(function() return cur.Parent end)
+        if not okp or not p then return false end
+        if p == model or (ma and addr_of(p) == ma) then return true end
+        cur = p
+    end
+    return false
+end
+local function cast(ax, ay, az, bx, by, bz)
+    local rc = raycast
+    local fn = rc and (rc.Cast or rc.cast)
+    if type(fn) ~= "function" or not (Vector3 and Vector3.New) then return nil end
+    local ok, hit, hpos, _, hinst = pcall(fn, Vector3.New(ax, ay, az), Vector3.New(bx, by, bz))
+    if not ok then return nil end
+    return { hit = hit == true, pos = hpos, inst = hinst }
+end
+-- Everything inside a target's character (body, Armor_xxx models, hair, the gun it holds): the
+-- addresses, and the parts. Fallen covers players in armor, so a ray usually stops on that first.
+local desc_cache, desc_count = {}, 0
+local DESC_TTL_MS = 1000
+local function target_insides(t)
+    local key = addr_of(t.obj) or t.obj
+    local now = now_ms()
+    local c = key ~= nil and desc_cache[key] or nil
+    if c and now - c.t < DESC_TTL_MS then return c end
+    c = { t = now, addrs = {}, parts = {}, names = {} }
+    local ok, list = pcall(function() return t.obj:GetDescendants() end)
+    if ok and type(list) == "table" then
+        for _, d in ipairs(list) do
+            local a = addr_of(d)
+            if a then c.addrs[a] = true end
+            local okn, n = pcall(function() return d.Name end)
+            if okn and type(n) == "string" then c.names[n] = true end
+            local okp, is_part = pcall(esp_scan.is_part, d)
+            if okp and is_part then c.parts[#c.parts + 1] = d end
+        end
+    end
+    for name, pd in pairs(t.parts or {}) do
+        local a = pd.part and addr_of(pd.part)
+        if a and not c.addrs[a] then
+            c.addrs[a] = true
+            c.parts[#c.parts + 1] = pd.part
+        end
+        if type(name) == "string" then c.names[name] = true end
+    end
+    local ma = addr_of(t.obj)
+    if ma then c.addrs[ma] = true end
+    if key ~= nil then
+        if desc_count > 64 then desc_cache, desc_count = {}, 0 end
+        desc_cache[key] = c
+        desc_count = desc_count + 1
+    end
+    return c
+end
+local HIT_PAD = 0.35
+-- a hit named like one of the player's own body parts (or armor / hair), that the player has, this
+-- close to the aimed part, is the player. Gun and attachment names ("Main"...) aren't trusted:
+-- base walls and barricades use the same names.
+local NAME_NEAR_STUDS = 4
+local BODY_NAMES = { Armor = true, HairPart = true, Head = true, Torso = true, HumanoidRootPart = true,
+    UpperTorso = true, LowerTorso = true, ["Left Arm"] = true, ["Right Arm"] = true, ["Left Leg"] = true,
+    ["Right Leg"] = true }
+for _, side in ipairs({ "Left", "Right" }) do
+    for _, piece in ipairs({ "UpperArm", "LowerArm", "Hand", "UpperLeg", "LowerLeg", "Foot" }) do
+        BODY_NAMES[side .. piece] = true
+    end
+end
+local function point_in_box(b, x, y, z, pad)
+    local dx, dy, dz = x - b.x, y - b.y, z - b.z
+    return math.abs(dx * b.rx + dy * b.ry + dz * b.rz) <= b.hx + pad
+        and math.abs(dx * b.ux + dy * b.uy + dz * b.uz) <= b.hy + pad
+        and math.abs(dx * b.lx + dy * b.ly + dz * b.lz) <= b.hz + pad
+end
+local function inst_label(inst)
+    if inst == nil then return "something" end
+    if type(inst) == "number" then return "#" .. tostring(inst) end
+    local ok, n = pcall(function() return inst.Name end)
+    return ok and n and tostring(n) or type(inst)
+end
+-- Is what a ray hit part of the target? Its address is inside the character, Vector's ancestry says
+-- so, or the hit point lies on one of the character's parts (armor included). A wall is none of these.
+-- Each part's position and box are read at most once a frame (the sight check runs several times
+-- a frame for every player in the FOV; reading every armor piece each time cost the overlay frames).
+local NEAR_PARTS = 6
+local geo = { frame = -1, pos = {}, box = {} }
+local function geo_frame()
+    local f = 0
+    pcall(function() f = April.require("core.debug").frame_count() end)
+    if geo.frame ~= f then geo.frame, geo.pos, geo.box = f, {}, {} end
+end
+local function cached_pos(p)
+    local v = geo.pos[p]
+    if v == nil then
+        local okp, pos = pcall(function() return p.Position end)
+        local x = okp and pos and tonumber(pos.X or pos.x)
+        v = x and { x, tonumber(pos.Y or pos.y), tonumber(pos.Z or pos.z) } or false
+        geo.pos[p] = v
+    end
+    return v or nil
+end
+local function cached_box(p)
+    local v = geo.box[p]
+    if v == nil then
+        local okb, b = pcall(esp_scan.read_part_box, p)
+        v = (okb and type(b) == "table" and b.hx) and b or false
+        geo.box[p] = v
+    end
+    return v or nil
+end
+function M.hit_is_target(t, r, ex, ey, ez)
+    local c = target_insides(t)
+    local inst = r.inst
+    local hp = r.pos
+    local hx, hy, hz = nil, nil, nil
+    if hp then hx, hy, hz = tonumber(hp.X or hp.x), tonumber(hp.Y or hp.y), tonumber(hp.Z or hp.z) end
+    -- cheapest first: the hit's address, its name, then its ancestry
+    if inst ~= nil then
+        local a = type(inst) == "number" and inst or addr_of(inst)
+        if a and c.addrs[a] then return true end
+        -- Vector's hit may not lead back to the character; one of its own part names right by the
+        -- part aimed at is the player all the same
+        if hx and ex and type(inst) ~= "number" then
+            local okn, n = pcall(function() return inst.Name end)
+            if okn and type(n) == "string" and BODY_NAMES[n] and c.names[n] then
+                local dx, dy, dz = hx - ex, hy - ey, hz - ez
+                if dx * dx + dy * dy + dz * dz <= NAME_NEAR_STUDS * NAME_NEAR_STUDS then return true end
+            end
+        end
+        if belongs_to(inst, t) then return true end
+    end
+    if not hx then return false end
+    -- on one of the player's own parts: the few nearest the hit, each read once a frame
+    geo_frame()
+    local near = {}
+    for _, p in ipairs(c.parts) do
+        local v = cached_pos(p)
+        if v then
+            local dx, dy, dz = v[1] - hx, v[2] - hy, v[3] - hz
+            local d2 = dx * dx + dy * dy + dz * dz
+            if d2 < 36 then near[#near + 1] = { p, d2 } end
+        end
+    end
+    table.sort(near, function(x, y) return x[2] < y[2] end)
+    for i = 1, math.min(#near, NEAR_PARTS) do
+        local b = cached_box(near[i][1])
+        if b and point_in_box(b, hx, hy, hz, HIT_PAD) then return true end
+    end
+    return false
+end
+local function note_block(r, ax, ay, az, bx, by, bz)
+    local short = nil
+    local hp = r.pos
+    if hp then
+        local dx, dy, dz = bx - ax, by - ay, bz - az
+        local len = sqrt(dx * dx + dy * dy + dz * dz)
+        if len > 1e-3 then
+            local hx, hy, hz = tonumber(hp.X or hp.x), tonumber(hp.Y or hp.y), tonumber(hp.Z or hp.z)
+            if hx then short = len - ((hx - ax) * dx + (hy - ay) * dy + (hz - az) * dz) / len end
+        end
+    end
+    M._last_block = { what = inst_label(r.inst), short = short }
+end
+-- A path piece in the open (the bullet's curve between two points in the air): blocked by anything
+-- except the target itself.
+function M.line_clear(aimbot, t, ax, ay, az, bx, by, bz)
+    local r = cast(ax, ay, az, bx, by, bz)
+    if not r then return aimbot.is_visible(t, ax, ay, az, bx, by, bz) end
+    if not r.hit then return true end
+    if M.hit_is_target(t, r, bx, by, bz) then return true end
+    note_block(r, ax, ay, az, bx, by, bz)
+    return false
+end
+-- How deep a part's box (real size and turn) reaches toward a ray aimed at its center.
+local function box_depth(box, ux, uy, uz)
+    local best = nil
+    for _, ax in ipairs({ { box.rx, box.ry, box.rz, box.hx }, { box.ux, box.uy, box.uz, box.hy },
+        { box.lx, box.ly, box.lz, box.hz } }) do
+        local c = math.abs(ux * ax[1] + uy * ax[2] + uz * ax[3])
+        if c > 1e-6 then
+            local d = ax[4] / c
+            if not best or d < best then best = d end
+        end
+    end
+    return best
+end
+function M.part_box(t, bone)
+    local pd = t.parts and t.parts[bone]
+    if not pd or not pd.part then return nil end
+    local ok, box = pcall(esp_scan.read_part_box, pd.part)
+    if ok and type(box) == "table" and box.hx then return box end
+    return nil
+end
+-- Does a ray aimed at a point on the target get there? Nothing in the way, or what it hit is the
+-- target: Vector says the hit belongs to it, or the ray stopped on the part's own surface (within
+-- SURFACE_SLACK of where a box of the part's real size and turn, centered on the point, begins).
+-- A wall even a little in front of the part stops it short of that, so it counts as blocked.
+local SURFACE_SLACK = 0.35
+local NO_BOX_DEPTH = 1.0
+-- Where the last ray that reached the target first touched it (nil when nothing was hit).
+local function remember_hit(r)
+    local hp = r and r.pos
+    local x = hp and tonumber(hp.X or hp.x)
+    M._reach_hit = x and { x = x, y = tonumber(hp.Y or hp.y), z = tonumber(hp.Z or hp.z) } or nil
+end
+function M.reaches(aimbot, t, ax, ay, az, bx, by, bz, box)
+    M._reach_hit = nil
+    local r = cast(ax, ay, az, bx, by, bz)
+    if not r then return aimbot.is_visible(t, ax, ay, az, bx, by, bz) end
+    if not r.hit then return true end
+    if M.hit_is_target(t, r, bx, by, bz) then
+        remember_hit(r)
+        return true
+    end
+    local hp = r.pos
+    if not hp then
+        note_block(r, ax, ay, az, bx, by, bz)
+        return false
+    end
+    local hx, hy, hz = tonumber(hp.X or hp.x), tonumber(hp.Y or hp.y), tonumber(hp.Z or hp.z)
+    if not hx then return false end
+    local dx, dy, dz = bx - ax, by - ay, bz - az
+    local len = sqrt(dx * dx + dy * dy + dz * dz)
+    if len < 1e-3 then return true end
+    local ux, uy, uz = dx / len, dy / len, dz / len
+    local hit_d = (hx - ax) * ux + (hy - ay) * uy + (hz - az) * uz
+    local depth = box and box_depth(box, ux, uy, uz) or NO_BOX_DEPTH
+    if hit_d >= len - depth - SURFACE_SLACK then
+        remember_hit(r)
+        return true
+    end
+    note_block(r, ax, ay, az, bx, by, bz)
+    return false
+end
+-- The part has to be in sight now (strictly: nothing but the target in the way), and the bullet's
+-- own path has to be clear: it leaves toward the aim spot and falls by the drop on the way, ending
+-- where the target will be. A curved path is checked in pieces, each middle piece cast 2.5 studs
+-- past its joint so a wall right at a joint still blocks it.
+local ARC_STEPS = 4
+local JOINT_OVERLAP = 2.5
+function M.can_hit(aimbot, t, ctx, pos)
+    local box = M.part_box(t, pos.bone)
+    if not M.reaches(aimbot, t, ctx.cx, ctx.cy, ctx.cz, pos.rx, pos.ry, pos.rz, box) then return false end
+    pos.first_hit = M._reach_hit
+    local drop = pos.drop or 0
+    local ex, ey, ez = pos.x, pos.y - drop, pos.z
+    if drop < 0.25 then
+        local mx, my, mz = ex - pos.rx, ey - pos.ry, ez - pos.rz
+        if mx * mx + my * my + mz * mz < 0.01 then return true end
+        return M.reaches(aimbot, t, ctx.cx, ctx.cy, ctx.cz, ex, ey, ez, box)
+    end
+    local ax, ay, az = ctx.cx, ctx.cy, ctx.cz
+    for i = 1, ARC_STEPS do
+        local u = i / ARC_STEPS
+        local bx = ctx.cx + (pos.x - ctx.cx) * u
+        local by = ctx.cy + (pos.y - ctx.cy) * u - drop * u * u
+        local bz = ctx.cz + (pos.z - ctx.cz) * u
+        local tx, ty, tz = bx, by, bz
+        if i < ARC_STEPS then
+            local dx, dy, dz = bx - ax, by - ay, bz - az
+            local len = sqrt(dx * dx + dy * dy + dz * dz)
+            if len > 0 then
+                tx, ty, tz = bx + dx / len * JOINT_OVERLAP, by + dy / len * JOINT_OVERLAP, bz + dz / len * JOINT_OVERLAP
+            end
+        end
+        if i == ARC_STEPS then
+            if not M.reaches(aimbot, t, ax, ay, az, bx, by, bz, box) then return false end
+        elseif not M.line_clear(aimbot, t, ax, ay, az, tx, ty, tz) then
+            return false
+        end
+        ax, ay, az = bx, by, bz
+    end
+    return true
+end
+-- Is any part of this player possibly inside the FOV? Their root on screen, with room for how big
+-- they are at that distance. Players clearly outside skip all the part checks.
+local function near_fov(t, w2s, scx, scy, fov, ctx)
+    local parts = t.parts or {}
+    local x, y, z = nil, nil, nil
+    local list = { t.root_part, parts.HumanoidRootPart and parts.HumanoidRootPart.part,
+        parts.UpperTorso and parts.UpperTorso.part, parts.Head and parts.Head.part }
+    for i = 1, 4 do
+        local part = list[i]
+        local ok, p = false, nil
+        if part then ok, p = pcall(function() return part.Position end) end
+        x = ok and p and tonumber(p.X or p.x) or nil
+        if x then
+            y, z = tonumber(p.Y or p.y), tonumber(p.Z or p.z)
+            break
+        end
+    end
+    if not x then return true, 0, 0 end
+    local dx, dy, dz = x - ctx.cx, y - ctx.cy, z - ctx.cz
+    local dist = sqrt(dx * dx + dy * dy + dz * dz)
+    if dist < 12 then return true, 0, dist end
+    local ok2, sx, sy, on = pcall(w2s, x, y, z)
+    if not ok2 or not on or type(sx) ~= "number" then return false end
+    local reach = fov + 60 + 2400 / dist
+    local fx, fy = sx - scx, sy - scy
+    local d2 = fx * fx + fy * fy
+    return d2 <= reach * reach, d2, dist
+end
+M.near_fov = near_fov
+local MAX_CHECKED = 4
+-- Best target this frame: for each target the first part (in Hit Part order) that is in the
+-- FOV, in range, hittable and strong enough; between targets, Target Priority decides: the one
+-- nearest the crosshair, or the one nearest to you.
+function M.find(aimbot, ctx, weapon, w2s, scx, scy)
+    local fov = M.fov()
+    local max_dist = settings.num("april_rage_max_dist", 800)
+    local need = M.min_damage()
+    local bone_mode = settings.num("april_rage_part", 0)
+    local by_dist = settings.num("april_rage_priority", 0) == 1
+    local best = nil
+    M._blocked = nil
+    local targets = aimbot.targets(settings.bool("april_rage_players", true), settings.bool("april_rage_npcs", true),
+        settings.bool("april_rage_team_check", true))
+    -- the players that could be in the FOV, and of those only the MAX_CHECKED nearest the crosshair
+    -- (or nearest you, with Target Priority Closest) get their parts checked this frame
+    local cands = {}
+    for i = 1, #targets do
+        local t = targets[i]
+        if aimbot.is_target_valid(t) then
+            local near, d2, wd = near_fov(t, w2s, scx, scy, fov, ctx)
+            if near and not is_downed(t) then cands[#cands + 1] = { t = t, d2 = d2 or 0, wd = wd or 0 } end
+        end
+    end
+    table.sort(cands, function(a, b)
+        if by_dist then return a.wd < b.wd end
+        return a.d2 < b.d2
+    end)
+    for ci = 1, math.min(#cands, MAX_CHECKED) do
+        local t = cands[ci].t
+        do
+            local found = false
+            for _, gi in ipairs(groups_to_try(t, bone_mode, scx, scy, w2s)) do
+                local g = M.GROUPS[gi]
+                for _, part in ipairs(g.parts) do
+                    local pos = part_of(t, part) and aimbot.aim_point(t, part, ctx) or nil
+                    if pos and pos.dist <= max_dist and (not ctx.max_range or pos.dist <= ctx.max_range) then
+                        -- the shot hits the part where it is, so the part itself must be in the FOV
+                        local sx, sy, on = w2s(pos.rx, pos.ry, pos.rz)
+                        if on then
+                            local dx, dy = sx - scx, sy - scy
+                            local d = sqrt(dx * dx + dy * dy)
+                            local dmg = damage.estimate(weapon, part, t, pos.dist)
+                            if d <= fov and dmg >= need then
+                                M._last_block = nil
+                                if M.can_hit(aimbot, t, ctx, pos) then
+                                    if not best or (by_dist and pos.dist < best.pos.dist) or (not by_dist and d < best.fov_d) then
+                                        best = { target = t, part = part, label = g.label, pos = pos, dmg = dmg,
+                                            fov_d = d, sx = sx, sy = sy }
+                                    end
+                                    found = true
+                                    break
+                                elseif not M._blocked or d < M._blocked.fov_d then
+                                    M._blocked = { target = t, part = part, fov_d = d, why = M._last_block }
+                                end
+                            end
+                        end
+                    end
+                end
+                if found then break end
+            end
+        end
+    end
+    return best
+end
+local function mouse_pos()
+    local fn = input and (input.GetMousePosition or input.get_mouse_position or input.get_mouse_pos)
+    if type(fn) ~= "function" then
+        fn = utility and (utility.get_mouse_pos or utility.GetMousePos)
+    end
+    if type(fn) ~= "function" then return nil end
+    local ok, a, b = pcall(fn)
+    if not ok then return nil end
+    if type(a) == "table" then a, b = a.x or a.X, a.y or a.Y end
+    if type(a) ~= "number" or type(b) ~= "number" then return nil end
+    return a, b
+end
+function M.cursor_in_game(sw, sh)
+    local mx, my = mouse_pos()
+    if not mx then return true end
+    return mx >= 0 and my >= 0 and mx <= sw and my <= sh
+end
+local function key_down(vk)
+    local fn = input and (input.is_key_down or input.IsKeyDown)
+    if type(fn) ~= "function" then return false end
+    local ok, v = pcall(fn, vk)
+    return ok and v == true
+end
+function M.next_gap()
+    return CLICK_MIN_MS + math.random() * (CLICK_MAX_MS - CLICK_MIN_MS)
+end
+-- Shots the gun really fired: each one ends a dry spell and marks the gun as one whose bullets
+-- can be seen.
+function M.note_shots(weapon)
+    shots.subscribe(SUB)
+    shots.poll()
+    for _, r in ipairs(shots.take(SUB)) do
+        local t = tonumber(r.t) or now_ms()
+        if t > state.last_shot then state.last_shot = t end
+        state.shot_weapon = weapon
+        state.dry_since = nil
+    end
+end
+function M.reload_state()
+    return state
+end
+local function press_reload()
+    local fn = utility and (utility.KeyPress or utility.key_press)
+    if type(fn) ~= "function" then return false end
+    return pcall(fn, RELOAD_VK, 30)
+end
+local function check_empty(weapon, now)
+    if not settings.bool("april_rage_reload_empty", false) then return end
+    if not state.dry_since or state.shot_weapon ~= weapon then return end
+    local cooldown = 100
+    pcall(function() cooldown = weapons.shot_interval_ms(weapon) or cooldown end)
+    if now - state.dry_since < cooldown + DRY_MARGIN_MS then return end
+    if press_reload() then
+        state.reload_until = now + RELOAD_WAIT_MS
+        state.dry_since = nil
+        state.reloads = state.reloads + 1
+    end
+end
+-- Auto Fire clicks from the frame only, right after that frame found and checked the target: every
+-- frame, at least 5-10 ms apart. A frame without a target never clicks. (A background click timer
+-- read the game alongside the frame; with the ragebot on a target that garbled ESP and Recoil
+-- Control and stopped Auto Fire.)
+local ARM_MS = 50
+local CLICK_TICK_MS = 2
+local click_thread = nil
+local function try_click(now, from_timer)
+    if now >= state.arm_until or now < state.next_click then return false end
+    if now < state.reload_until then
+        state.fire_why = "reloading"
+        return false
+    end
+    if state.arm_bow and not key_down(RMB) then return false end
+    local click = utility and (utility.MouseClick or utility.mouse_click)
+    if type(click) ~= "function" then
+        state.fire_why = "Vector has no mouse click here"
+        return false
+    end
+    if from_timer then
+        -- a click between frames: only if the part is still hittable right now
+        local ok, still = pcall(M.recheck)
+        if not ok or not still then
+            state.arm_until = 0
+            silent_hook.stop(OWNER)
+            return false
+        end
+    end
+    local aim = state.aim
+    if from_timer and aim then silent_hook.set(OWNER, aim.origin, aim.dir, aim.meta) end
+    if not pcall(click, "left") then
+        state.fire_why = "the mouse click failed"
+        return false
+    end
+    state.fire_until = now + FIRE_WINDOW_MS
+    state.next_click = now + M.next_gap()
+    state.clicks = (state.clicks or 0) + 1
+    if not state.dry_since then state.dry_since = now end
+    if not state.arm_bow then check_empty(state.weapon, now) end
+    -- Recoil Control hears the clicks that really fire a shot (the gun's own fire interval), the
+    -- way it hears you holding left click; clicks the game ignores during the cooldown aren't shots
+    local interval = 100
+    pcall(function() interval = tonumber(weapons.shot_interval_ms(state.weapon)) or interval end)
+    if now - (state.last_shot_click or -1e9) >= interval * 0.95 then
+        state.last_shot_click = now
+        if state.pick then M.spend_roll(state.pick.target) end
+        local ok, rcs = pcall(April.require, "features.combat.recoil_control")
+        if ok and rcs and rcs.note_fire then pcall(rcs.note_fire, now) end
+    end
+    return true
+end
+-- Right before a click from the background timer: is the picked part still in plain sight, with a
+-- clear path, from where the camera is now, and is the target still up? The shot is re-aimed at
+-- where the part is now. Anything else stops Auto Fire on the spot.
+function M.recheck()
+    local pick, fctx = state.pick, state.ctx
+    if not pick or not fctx or not settings.enabled(P) then return false end
+    local aimbot = April.require("features.combat.aimbot")
+    if not aimbot.is_target_valid(pick.target) or is_downed(pick.target) then return false end
+    local ctx = { prediction = false, drop = fctx.drop, speed = fctx.speed, gravity = fctx.gravity,
+        max_range = fctx.max_range, cx = fctx.cx, cy = fctx.cy, cz = fctx.cz }
+    pcall(function()
+        local c = (camera.get_position or camera.GetPosition)()
+        local x, y, z = tonumber(c.X or c.x), tonumber(c.Y or c.y), tonumber(c.Z or c.z)
+        if x and y and z then ctx.cx, ctx.cy, ctx.cz = x, y, z end
+    end)
+    local pos = aimbot.aim_point(pick.target, pick.part, ctx)
+    if not pos or not M.can_hit(aimbot, pick.target, ctx, pos) then return false end
+    local origin, dir = M.shot_ray(ctx, { pos = pos })
+    if not origin then return false end
+    state.aim = { origin = origin, dir = dir, meta = state.aim and state.aim.meta }
+    return true
+end
+function M.click_tick()
+    return try_click(now_ms(), true)
+end
+-- (no background click timer any more; this only stops one left over from an older load)
+local function ensure_click_thread()
+end
+local function stop_click_thread()
+    state.arm_until = 0
+    if not click_thread then return end
+    local stop = thread and (thread.Stop or thread.stop)
+    if type(stop) == "function" then pcall(stop, click_thread) end
+    click_thread = nil
+end
+M.stop_click_thread = stop_click_thread
+local function auto_fire(weapon, aim)
+    state.fire_why = nil
+    if not settings.bool("april_rage_autofire", true) then
+        state.arm_until = 0
+        return
+    end
+    -- a bow shoots when you click while drawing it with right click
+    local bow = weapons.is_bow_weapon_name and weapons.is_bow_weapon_name(weapon)
+    if bow and not key_down(RMB) then
+        state.arm_until = 0
+        state.fire_why = "hold right click to draw the bow"
+        return
+    end
+    local now = now_ms()
+    stop_click_thread()
+    state.arm_until, state.arm_bow, state.aim = now + 1, bow, aim
+    try_click(now, false)
+end
+-- Magic bullet: the shot's ray starts MAGIC_BACK studs in front of the part, on the line from your
+-- camera that was just checked clear, and runs MAGIC_PAST studs into it, so spread, recoil, drop or
+-- travel time can't make it miss.
+local MAGIC_BACK, MAGIC_PAST, MAGIC_LEAD = 2.5, 3, 0.5
+M.SHOT_MAGIC, M.SHOT_SILENT = 0, 1
+local function magic_ray(ctx, pick)
+    local px, py, pz = pick.pos.rx, pick.pos.ry, pick.pos.rz
+    local dx, dy, dz = px - ctx.cx, py - ctx.cy, pz - ctx.cz
+    local len = sqrt(dx * dx + dy * dy + dz * dz)
+    if len < 0.01 then return nil end
+    local ux, uy, uz = dx / len, dy / len, dz / len
+    local back = math.min(MAGIC_BACK, len * 0.5)
+    local fh = pick.pos.first_hit
+    if fh and fh.x then
+        -- start half a stud before the first spot of the target the camera sees (a piece in front
+        -- of this one, if there is one), so the shot can only land on something in plain sight
+        local seen = (fh.x - ctx.cx) * ux + (fh.y - ctx.cy) * uy + (fh.z - ctx.cz) * uz
+        back = math.max(0.5, math.min(len - seen + MAGIC_LEAD, len * 0.95))
+    end
+    local reach = back + MAGIC_PAST
+    return { x = px - ux * back, y = py - uy * back, z = pz - uz * back }, { x = ux * reach, y = uy * reach, z = uz * reach }
+end
+M.magic_ray = magic_ray
+-- Silent Aim: the shot's ray from your camera straight at the part (no lead).
+local function silent_ray(ctx, pick)
+    local px, py, pz = pick.pos.rx, pick.pos.ry, pick.pos.rz
+    local dx, dy, dz = px - ctx.cx, py - ctx.cy, pz - ctx.cz
+    if dx * dx + dy * dy + dz * dz < 1e-4 then return nil end
+    return { x = ctx.cx, y = ctx.cy, z = ctx.cz }, { x = dx, y = dy, z = dz }
+end
+function M.shot_mode()
+    return settings.num("april_rage_shot", M.SHOT_MAGIC) == M.SHOT_SILENT and M.SHOT_SILENT or M.SHOT_MAGIC
+end
+local function shot_ray(ctx, pick)
+    if M.shot_mode() == M.SHOT_SILENT then return silent_ray(ctx, pick) end
+    return magic_ray(ctx, pick)
+end
+M.shot_ray = shot_ray
+local function target_name(t)
+    local ok, n = pcall(function() return t.obj.Name end)
+    if ok and type(n) == "string" and n ~= "" then return n end
+    return t.npc and "NPC" or "Target"
+end
+local function draw_status(scx, scy, pick)
+    if not settings.bool("april_rage_indicator", true) then return end
+    local y = scy + 22
+    local need, overridden = M.min_damage()
+    if overridden then
+        local label = "MIN DMG OVERRIDE " .. math.floor(need + 0.5)
+        draw_util.text(scx - text_w(label, 11) * 0.5, y, label, { 1, 0.55, 0.25, 1 }, 11)
+        y = y + 14
+    end
+    if not pick then
+        local b = M._blocked
+        if b then
+            local label = target_name(b.target) .. "  behind cover"
+            local why = b.why
+            if why then
+                label = label .. string.format("  (hit %s%s)", tostring(why.what),
+                    why.short and string.format(", %.1f short", why.short) or "")
+            end
+            draw_util.text(scx - text_w(label, 11) * 0.5, y, label, { 0.7, 0.7, 0.7, 0.85 }, 11)
+        end
+        return
+    end
+    local circle = draw and (draw.circle or draw.Circle)
+    if circle then pcall(circle, pick.sx, pick.sy, 4, { 1, 0.3, 0.3, 0.95 }, 16) end
+    local label = string.format("%s  %s  ~%d dmg", target_name(pick.target), pick.label or PART_LABEL[pick.part] or pick.part,
+        math.floor(pick.dmg + 0.5))
+    draw_util.text(scx - text_w(label, 11) * 0.5, y, label, { 1, 0.42, 0.42, 1 }, 11)
+    if state.fire_why then
+        local why = "Auto Fire: " .. state.fire_why
+        draw_util.text(scx - text_w(why, 11) * 0.5, y + 14, why, { 1, 0.7, 0.3, 0.95 }, 11)
+    end
+end
+function M.register_menu()
+    local G = menu_util.G
+    local T = menu_util.group(G.MISC)
+    menu_util.register_keybind(T, G.MISC, P, "Ragebot", false)
+    menu_util.register_keybind(T, G.MISC, P_OVERRIDE, "Min Damage Override", false, { default_mode = 1 })
+end
+function M.update(_dt)
+    if settings.enabled(P) then
+        April.require("features.combat.aimbot").ensure_scan()
+    end
+    pcall(M.balance_parts)
+end
+function M.draw()
+    if not settings.enabled(P) then
+        state.pick = nil
+        M._screen_target = nil
+        stop_click_thread()
+        silent_hook.release(OWNER)
+        shots.unsubscribe(SUB)
+        return
+    end
+    local sw, sh = draw_util.screen_size()
+    local scx, scy = sw * 0.5, sh * 0.5
+    if settings.bool("april_rage_draw_fov", false) then
+        draw_util.fill_fov("april_rage_fill_fov", scx, scy, M.fov(), { 1, 0.3, 0.3, 0.25 })
+        local circle = draw and (draw.circle or draw.Circle)
+        if circle then
+            pcall(circle, scx, scy, M.fov(),
+                settings.color("april_rage_draw_fov", { 1, 0.3, 0.3, 0.8 }), 64)
+        end
+    end
+    local weapon = weapons.cached_held_ranged()
+    -- the same true-camera projection as ESP: the FOV check and the markers don't lag the mouse
+    local w2s = April.require("core.esp_util").w2s
+    if weapon ~= state.weapon then
+        state.weapon, state.dry_since = weapon, nil
+    end
+    if settings.bool("april_rage_reload_empty", false) and settings.bool("april_rage_autofire", true) then
+        M.note_shots(weapon)
+    else
+        shots.unsubscribe(SUB)
+    end
+    if menu_open() or not weapon or type(w2s) ~= "function" then
+        state.pick = nil
+        state.dry_since = nil
+        state.arm_until = 0
+        silent_hook.stop(OWNER)
+        draw_status(scx, scy, nil)
+        return
+    end
+    if not silent_hook.acquire(OWNER) then
+        state.pick = nil
+        state.arm_until = 0
+        return
+    end
+    local aimbot = April.require("features.combat.aimbot")
+    local ctx = aimbot.make_ctx()
+    -- neither shot mode leads the target; the drop stays in the path check
+    ctx.prediction, ctx.drop = false, true
+    local pick = M.find(aimbot, ctx, weapon, w2s, scx, scy)
+    state.pick, state.ctx = pick, ctx
+    if not pick then
+        M._screen_target = nil
+        state.dry_since = nil
+        state.arm_until = 0
+        silent_hook.stop(OWNER)
+        draw_status(scx, scy, nil)
+        return
+    end
+    -- the shot (magic bullet or silent aim, through the silent hook): shots fired while left
+    -- click is held go to the pick
+    -- your own left click is a shot too: its part was this frame's roll, the next one rolls again
+    local lmb = key_down(LMB)
+    if lmb and not state.lmb_was then M.spend_roll(pick.target) end
+    state.lmb_was = lmb
+    local origin, dir = shot_ray(ctx, pick)
+    if not origin then
+        state.arm_until = 0
+        silent_hook.stop(OWNER)
+        draw_status(scx, scy, pick)
+        return
+    end
+    local meta = { part = pick.part, model = pick.target.obj, aim = { x = pick.pos.rx, y = pick.pos.ry, z = pick.pos.rz } }
+    if M.cursor_in_game(sw, sh) then
+        auto_fire(weapon, { origin = origin, dir = dir, meta = meta })
+    else
+        state.arm_until = 0
+        state.fire_why = settings.bool("april_rage_autofire", true) and "cursor is outside the game" or nil
+    end
+    silent_hook.track(OWNER, origin, dir, LMB, meta)
+    if now_ms() < state.fire_until then silent_hook.set(OWNER, origin, dir, meta) end
+    M._screen_target = { x = pick.sx, y = pick.sy, t = now_ms() }
+    draw_status(scx, scy, pick)
+end
+return M
+end)()
+
+April._mods["features.combat.heli_aimbot"] = (function()
+-- Attack Heli aimbot: camera aimbot locked onto the Attack Heli event. Aims at a rotor
+-- weak point and leads it with an intercept solve: heli motion (velocity + turning
+-- acceleration fitted from observed positions), bullet speed, and bullet drop.
+local settings = April.require("core.settings")
+local env = April.require("core.env")
+local cache = April.require("core.cache")
+local npcs = April.require("game.npcs")
+local weapons = April.require("game.weapons")
+local combat_stats = April.require("game.combat_stats")
+local combat_origin = April.require("game.combat_origin")
+local draw_util = April.require("core.draw_util")
+local M = {}
+local sqrt, abs, min = math.sqrt, math.abs, math.min
+local P = "april_heli_aim"
+local TARGET_AUTO, TARGET_MAIN, TARGET_TAIL = 0, 1, 2
+local HISTORY_S = 0.6
+local LINEAR_WINDOW_S = 0.25
+local MIN_FIT_S = 0.08
+local MAX_SPEED = 400
+local MAX_ACCEL = 120
+-- Acceleration is only trusted this far ahead; past it a turning heli is better led straight.
+local ACCEL_HORIZON_S = 1.5
+local MAX_TURN = 3
+local WEAK_REFRESH_S = 0.75
+local hist = {}
+local hist_key = nil
+local weak = { model = nil, at = -1, list = {} }
+local last_solve = nil
+local function now_s()
+    local fn = utility and (utility.get_time or utility.GetTime)
+    if type(fn) == "function" then
+        local ok, v = pcall(fn)
+        if ok and tonumber(v) then return tonumber(v) end
+    end
+    fn = utility and (utility.get_tick_count or utility.GetTickCount)
+    if type(fn) ~= "function" then return 0 end
+    local ok, v = pcall(fn)
+    return (ok and tonumber(v) or 0) / 1000
+end
+local function get_key(id)
+    local ok, vk = pcall(function() return April.require("ui.gs_state").get_key(id) end)
+    return ok and tonumber(vk) or 0
+end
+local function key_down(vk)
+    if not vk or vk <= 0 or not input then return false end
+    local fn = input.is_key_down or input.IsKeyDown
+    if type(fn) ~= "function" then return false end
+    local ok, down = pcall(fn, vk)
+    return ok and down == true
+end
+local function part_xyz(part)
+    if not part or not env.is_valid(part) then return nil end
+    local p = part.Position or part.position
+    if not p then return nil end
+    local x, y, z = p.X or p.x, p.Y or p.y, p.Z or p.z
+    if not x then return nil end
+    return x, y, z
+end
+-- Returns bullet speed (studs/s), gravity (studs/s^2), weapon name and where the stats came from.
+local function ballistics()
+    local speed = settings.num(P .. "_bullet_speed", 2100)
+    local grav = settings.num(P .. "_gravity", 108)
+    if not settings.bool(P .. "_auto_weapon", true) then
+        return speed, grav, nil, "manual"
+    end
+    local ok_n, name = pcall(function()
+        return weapons.cached_held_ranged() or weapons.get_held_ranged_weapon_name()
+    end)
+    if not ok_n or type(name) ~= "string" then return speed, grav, nil, "manual" end
+    local ok_b, base = pcall(weapons.get_weapon_stats, name)
+    if not ok_b then base = nil end
+    local ok, eff = pcall(combat_stats.get_effective_stats, name)
+    if not ok or not eff or not tonumber(eff.speed) or eff.speed <= 0 then
+        return speed, grav, name, "manual"
+    end
+    local source = "guess"
+    if base and base.from_toolinfo then source = "game data"
+    elseif base and base.from_fallback then source = "measured table"
+    elseif base and base.from_attributes then source = "tool attributes" end
+    return eff.speed, weapons.drop_gravity(tonumber(eff.gravity) or 0.55), name, source
+end
+-- Least-squares fit of the sampled path. It is evaluated at the window's mean time, where the
+-- fit is least biased on a curving path, and returns velocity, acceleration, position at that
+-- time and the time itself. Quadratic fits acceleration too; linear uses a short window.
+function M.fit_motion(samples, t_now, quadratic)
+    local n0 = #samples
+    if n0 < 3 or t_now - samples[1].t < MIN_FIT_S then return nil end
+    local tm, nm = 0, 0
+    for i = 1, n0 do
+        local tau = samples[i].t - t_now
+        if quadratic or tau >= -LINEAR_WINDOW_S then tm = tm + samples[i].t; nm = nm + 1 end
+    end
+    if nm < 2 then return nil end
+    tm = tm / nm
+    local s0, s1, s2, s3, s4 = 0, 0, 0, 0, 0
+    local bx0, by0, bz0, bx1, by1, bz1, bx2, by2, bz2 = 0, 0, 0, 0, 0, 0, 0, 0, 0
+    for i = 1, n0 do
+        local h = samples[i]
+        if quadratic or h.t - t_now >= -LINEAR_WINDOW_S then
+            local tau = h.t - tm
+            local t2 = tau * tau
+            s0 = s0 + 1; s1 = s1 + tau; s2 = s2 + t2; s3 = s3 + t2 * tau; s4 = s4 + t2 * t2
+            bx0 = bx0 + h.x; by0 = by0 + h.y; bz0 = bz0 + h.z
+            bx1 = bx1 + tau * h.x; by1 = by1 + tau * h.y; bz1 = bz1 + tau * h.z
+            bx2 = bx2 + t2 * h.x; by2 = by2 + t2 * h.y; bz2 = bz2 + t2 * h.z
+        end
+    end
+    local v, a, p0
+    if quadratic and s0 >= 5 then
+        local det = s0 * (s2 * s4 - s3 * s3) - s1 * (s1 * s4 - s3 * s2) + s2 * (s1 * s3 - s2 * s2)
+        if abs(det) > 1e-12 then
+            local function c012(b0, b1, b2)
+                local c0 = (b0 * (s2 * s4 - s3 * s3) - s1 * (b1 * s4 - s3 * b2) + s2 * (b1 * s3 - s2 * b2)) / det
+                local c1 = (s0 * (b1 * s4 - s3 * b2) - b0 * (s1 * s4 - s3 * s2) + s2 * (s1 * b2 - b1 * s2)) / det
+                local c2 = (s0 * (s2 * b2 - b1 * s3) - s1 * (s1 * b2 - b1 * s2) + b0 * (s1 * s3 - s2 * s2)) / det
+                return c0, c1, 2 * c2
+            end
+            local px, vx, ax = c012(bx0, bx1, bx2)
+            local py, vy, ay = c012(by0, by1, by2)
+            local pz, vz, az = c012(bz0, bz1, bz2)
+            p0 = { x = px, y = py, z = pz }
+            v = { x = vx, y = vy, z = vz }
+            a = { x = ax, y = ay, z = az }
+        end
+    end
+    if not v then
+        local det2 = s0 * s2 - s1 * s1
+        if s0 < 2 or abs(det2) < 1e-12 then return nil end
+        p0 = {
+            x = (s2 * bx0 - s1 * bx1) / det2,
+            y = (s2 * by0 - s1 * by1) / det2,
+            z = (s2 * bz0 - s1 * bz1) / det2,
+        }
+        v = {
+            x = (s0 * bx1 - s1 * bx0) / det2,
+            y = (s0 * by1 - s1 * by0) / det2,
+            z = (s0 * bz1 - s1 * bz0) / det2,
+        }
+        a = { x = 0, y = 0, z = 0 }
+    end
+    if v.x * v.x + v.y * v.y + v.z * v.z > MAX_SPEED * MAX_SPEED then return nil end
+    local am = sqrt(a.x * a.x + a.y * a.y + a.z * a.z)
+    if am > MAX_ACCEL then
+        local k = MAX_ACCEL / am
+        a.x, a.y, a.z = a.x * k, a.y * k, a.z * k
+    end
+    return v, a, p0, tm
+end
+-- Where the target will be after lt seconds. Horizontal acceleration is split into a turn
+-- (velocity rotating at a constant rate, which follows an orbit) and a speed change.
+function M.predict_offset(v, a, lt)
+    local ta = min(lt, ACCEL_HORIZON_S)
+    local ox, oz
+    local hv2 = v.x * v.x + v.z * v.z
+    local w = hv2 > 1 and (v.x * a.z - v.z * a.x) / hv2 or 0
+    if abs(w) > 1e-3 then
+        if w > MAX_TURN then w = MAX_TURN elseif w < -MAX_TURN then w = -MAX_TURN end
+        local wt = w * ta
+        local cw, sw = math.cos(wt), math.sin(wt)
+        local S, C = sw / w, (1 - cw) / w
+        ox = v.x * S - v.z * C
+        oz = v.x * C + v.z * S
+        local k = (v.x * a.x + v.z * a.z) / hv2
+        ox = ox + 0.5 * k * v.x * ta * ta
+        oz = oz + 0.5 * k * v.z * ta * ta
+        if lt > ta then
+            ox = ox + (v.x * cw - v.z * sw) * (lt - ta)
+            oz = oz + (v.x * sw + v.z * cw) * (lt - ta)
+        end
+    else
+        ox = v.x * lt + 0.5 * a.x * ta * ta
+        oz = v.z * lt + 0.5 * a.z * ta * ta
+    end
+    return ox, v.y * lt + 0.5 * a.y * ta * ta, oz
+end
+-- Intercept: find flight time t where a bullet from origin o (speed, gravity g) meets the
+-- point p moving with v/a. p is the target `elapsed` seconds ago (the fit's reference time).
+-- Returns the launch vector (aim point = o + d) and t.
+function M.solve_intercept(o, p, v, a, speed, g, latency, lead, elapsed)
+    elapsed = elapsed or 0
+    local t = 0
+    local dx, dy, dz = p.x - o.x, p.y - o.y, p.z - o.z
+    for _ = 1, 12 do
+        local ox, oy, oz = M.predict_offset(v, a, elapsed + (t + latency) * lead)
+        dx, dy, dz = p.x + ox - o.x, p.y + oy - o.y + 0.5 * g * t * t, p.z + oz - o.z
+        local nt = sqrt(dx * dx + dy * dy + dz * dz) / speed
+        local done = abs(nt - t) < 1e-5
+        t = nt
+        if done then break end
+    end
+    return dx, dy, dz, t
+end
+local function find_heli(cx, cy, cz, max_dist)
+    local best, best_d = nil, max_dist
+    for _, e in ipairs(cache.npcs or {}) do
+        if e.kind == "heli" and e.inst and env.is_valid(e.inst) then
+            local x, y, z = part_xyz(e.root)
+            if x then
+                local dx, dy, dz = x - cx, y - cy, z - cz
+                local d = sqrt(dx * dx + dy * dy + dz * dz)
+                if d < best_d then best, best_d = e, d end
+            end
+        end
+    end
+    return best
+end
+local function centroid(list)
+    local n = #list
+    if n == 0 then return nil end
+    local x, y, z = 0, 0, 0
+    for i = 1, n do x = x + list[i].x; y = y + list[i].y; z = z + list[i].z end
+    return { x = x / n, y = y / n, z = z / n }
+end
+-- Rotor blades spin, so a single blade's centre orbits the hub; the centroid of all of a
+-- rotor's parts stays on the hub and is a stable point to lead.
+local function aim_point(entry, mode, t)
+    local model = entry.inst
+    if weak.model ~= model or t - weak.at >= WEAK_REFRESH_S then
+        weak.model = model
+        weak.at = t
+        weak.list = npcs.collect_heli_weak_points(model) or {}
+    end
+    local main, tail, main_b, tail_b = {}, {}, {}, {}
+    for _, w in ipairs(weak.list) do
+        local x, y, z = part_xyz(w.part)
+        if x then
+            local pt = { x = x, y = y, z = z }
+            local is_tail = tostring(w.name or ""):lower():find("tail", 1, true) ~= nil
+            local bonus = (w.score or 0) >= 100
+            if is_tail then
+                tail[#tail + 1] = pt
+                if bonus then tail_b[#tail_b + 1] = pt end
+            else
+                main[#main + 1] = pt
+                if bonus then main_b[#main_b + 1] = pt end
+            end
+        end
+    end
+    local pick
+    if mode == TARGET_MAIN then
+        pick = centroid(main_b) or centroid(main)
+    elseif mode == TARGET_TAIL then
+        pick = centroid(tail_b) or centroid(tail)
+    elseif mode == TARGET_AUTO then
+        pick = centroid(main_b) or centroid(tail_b) or centroid(main) or centroid(tail)
+    end
+    if pick then return pick end
+    local x, y, z = part_xyz(entry.root)
+    if x then return { x = x, y = y, z = z } end
+    return nil
+end
+local function sample(entry, t)
+    local key = entry.key or tostring(entry.inst)
+    if key ~= hist_key then
+        hist = {}
+        hist_key = key
+    end
+    local x, y, z = part_xyz(entry.root)
+    if not x then return nil end
+    local last = hist[#hist]
+    local add = true
+    if last then
+        local dt = t - last.t
+        local dx, dy, dz = x - last.x, y - last.y, z - last.z
+        local d2 = dx * dx + dy * dy + dz * dz
+        -- The client gets new heli positions slower than it renders, so most frames repeat
+        -- the last one. Only real updates are kept, stamped when they first appear.
+        if dt <= 0 or d2 < 1e-8 then
+            add = false
+        elseif d2 > (MAX_SPEED * dt + 5) ^ 2 then
+            -- a jump faster than any heli can fly is a respawn/teleport: restart the fit
+            hist = {}
+        end
+    end
+    if add then hist[#hist + 1] = { t = t, x = x, y = y, z = z } end
+    local cut = 0
+    for i = 1, #hist do
+        if t - hist[i].t > HISTORY_S then cut = i else break end
+    end
+    if cut > 0 then
+        for i = 1, #hist - cut do hist[i] = hist[i + cut] end
+        for i = #hist, #hist - cut + 1, -1 do hist[i] = nil end
+    end
+    return { x = x, y = y, z = z }
+end
+local function engine_velocity(entry)
+    local v
+    pcall(function()
+        local r = entry.root
+        local vel = r.AssemblyLinearVelocity or r.Velocity
+        if vel then v = { x = vel.X or vel.x, y = vel.Y or vel.y, z = vel.Z or vel.z } end
+    end)
+    if not v or not v.x then return nil end
+    local sp2 = v.x * v.x + v.y * v.y + v.z * v.z
+    if sp2 < 0.25 or sp2 > MAX_SPEED * MAX_SPEED then return nil end
+    return v
+end
+local function camera_pos()
+    local ok, pos = pcall(function() return (camera.get_position or camera.GetPosition)() end)
+    if not ok or not pos then return nil end
+    local x, y, z = pos.X or pos.x, pos.Y or pos.y, pos.Z or pos.z
+    if not x then return nil end
+    return { x = x, y = y, z = z }
+end
+local function draw_circle(x, y, r, col, filled)
+    local fn = draw and (filled and (draw.circle_filled or draw.CircleFilled) or (draw.circle or draw.Circle))
+    if type(fn) == "function" then pcall(fn, x, y, r, col, 32) end
+end
+local function draw_line(x1, y1, x2, y2, col)
+    local fn = draw and (draw.line or draw.Line)
+    if type(fn) == "function" then pcall(fn, x1, y1, x2, y2, col, 1.5) end
+end
+function M.update(_dt) end
+function M.draw()
+    last_solve = nil
+    if not settings.bool(P .. "_enabled", false) then
+        hist, hist_key = {}, nil
+        return
+    end
+    local t = now_s()
+    local sw, sh = draw_util.screen_size()
+    local scx, scy = sw / 2, sh / 2
+    local fov = settings.num(P .. "_fov", 300)
+    if settings.bool(P .. "_draw_fov", false) then
+        draw_util.fill_fov(P .. "_fill_fov", scx, scy, fov, { 1, 0.55, 0.2, 0.25 })
+        draw_circle(scx, scy, fov, settings.color(P .. "_draw_fov", { 1, 0.55, 0.2, 1 }))
+    end
+    local cam = camera_pos()
+    if not cam then return end
+    local entry = find_heli(cam.x, cam.y, cam.z, settings.num(P .. "_max_dist", 1000))
+    if not entry then
+        hist, hist_key = {}, nil
+        return
+    end
+    -- sample every frame, even while not aiming, so the fit is warm when the key goes down
+    local root_now = sample(entry, t)
+    local point = aim_point(entry, settings.num(P .. "_target", TARGET_AUTO), t)
+    if not point then return end
+    local base = point
+    local origin = combat_origin.get_fire_origin() or cam
+    local speed, g, weapon_name, source = ballistics()
+    if not settings.bool(P .. "_drop", true) then g = 0 end
+    local zero = { x = 0, y = 0, z = 0 }
+    local v, a = zero, zero
+    local elapsed = 0
+    local motion = "off"
+    if settings.bool(P .. "_prediction", true) then
+        local fv, fa, fp, ft = M.fit_motion(hist, t, settings.bool(P .. "_accel", true))
+        if fv then
+            v, a, motion = fv, fa, "fitted"
+            elapsed = t - ft
+            -- project from the fit's own position estimate, not the last (possibly stale) update
+            if fp and root_now then
+                base = {
+                    x = point.x + fp.x - root_now.x,
+                    y = point.y + fp.y - root_now.y,
+                    z = point.z + fp.z - root_now.z,
+                }
+            end
+        else
+            local ev = engine_velocity(entry)
+            if ev then v, motion = ev, "engine" else motion = "warming up" end
+        end
+    end
+    local latency = settings.num(P .. "_latency", 0) / 1000
+    local lead = settings.num(P .. "_lead", 100) / 100
+    local dx, dy, dz, tof = M.solve_intercept(origin, base, v, a, speed, g, latency, lead, elapsed)
+    local ax, ay, az = origin.x + dx, origin.y + dy, origin.z + dz
+    local drop = 0.5 * g * tof * tof
+    local w2s = April.require("core.esp_util").w2s
+    if type(w2s) ~= "function" then return end
+    local sx, sy, on = w2s(ax, ay, az)
+    local pdx, pdy, pdz = point.x - origin.x, point.y - origin.y, point.z - origin.z
+    last_solve = {
+        dist = sqrt(pdx * pdx + pdy * pdy + pdz * pdz),
+        tof = tof,
+        speed = speed,
+        gravity = g,
+        drop = drop,
+        heli_speed = sqrt(v.x * v.x + v.y * v.y + v.z * v.z),
+        lead = sqrt((ax - point.x) ^ 2 + (ay - drop - point.y) ^ 2 + (az - point.z) ^ 2),
+        weapon = weapon_name,
+        source = source,
+        motion = motion,
+        aim = { x = ax, y = ay, z = az },
+        impact = { x = ax, y = ay - drop, z = az },
+    }
+    if settings.bool(P .. "_debug", false) then
+        local col = settings.color(P .. "_debug", { 1, 0.85, 0.2, 1 })
+        local px, py, pon = w2s(point.x, point.y, point.z)
+        local ix, iy, ion = w2s(ax, ay - drop, az)
+        if pon then draw_circle(px, py, 4, { 1, 1, 1, 0.9 }, true) end
+        if ion then draw_circle(ix, iy, 5, col) end
+        if on then draw_circle(sx, sy, 3, col, true) end
+        if pon and ion then draw_line(px, py, ix, iy, col) end
+        if ion and on then draw_line(ix, iy, sx, sy, { col[1], col[2], col[3], 0.5 }) end
+        local s = last_solve
+        local lines = {
+            string.format("Heli %.0f studs  |  flight %.3fs", s.dist, s.tof),
+            string.format("Heli speed %.1f st/s  |  lead %.1f st  |  drop %.2f st", s.heli_speed, s.lead, s.drop),
+            string.format("%s  |  %.0f st/s, g %.1f  (%s)", tostring(s.weapon or "no weapon"), s.speed, s.gravity, s.source),
+            "Motion: " .. s.motion,
+        }
+        local ty = scy + fov + 8
+        for i = 1, #lines do
+            draw_util.text(scx - 160, ty, lines[i], col, 12)
+            ty = ty + 14
+        end
+    end
+    local key = get_key(P .. "_key")
+    if key <= 0 then key = get_key("april_aimbot_key") end
+    if not key_down(key) then return end
+    if not on then return end
+    local fdx, fdy = sx - scx, sy - scy
+    if sqrt(fdx * fdx + fdy * fdy) > fov then return end
+    if settings.bool(P .. "_visible_only", false) then
+        local fn = raycast and (raycast.is_visible or raycast.IsVisible)
+        if type(fn) == "function" then
+            local ok, vis = pcall(fn, cam.x, cam.y, cam.z, point.x, point.y, point.z)
+            if ok and vis == false then return end
+        end
+    end
+    local look = camera and (camera.look_at or camera.LookAt)
+    if type(look) ~= "function" then return end
+    local ok_r, rcs = pcall(April.require, "features.combat.recoil_control")
+    local pre_p, pre_y = nil, nil
+    if ok_r and rcs then pre_p, pre_y = rcs.angles() end
+    pcall(look, ax, ay, az, settings.num(P .. "_smooth", 3))
+    if ok_r and rcs then rcs.script_move(pre_p, pre_y) end
+end
+function M.last_solve()
+    return last_solve
+end
+return M
+end)()
+
+April._mods["ui.catalog_rage"] = (function()
+local I = April.require("ui.catalog_items")
+local cb, kb, sl, combo, sep = I.cb, I.kb, I.sl, I.combo, I.sep
+local M = {}
+function M.build()
+local R = "april_rage_enabled"
+local ragebot = {
+title = "Ragebot",
+items = {
+kb(R, "Ragebot", false, nil, { tip = "Finds a target part in the FOV that's in plain sight and that a shot can really reach for at least Min Damage, sends the shot there, and with Auto Fire pulls the trigger for you." }),
+combo("april_rage_shot", "Shot Mode", { "Magic Bullet", "Silent Aim" }, 0, R, { tip = "Magic Bullet: the shot starts right in front of the part and can't miss. Silent Aim: the shot goes from your camera straight at the part. Neither leads the target, and both only shoot parts in plain sight." }),
+I.label("Shoots any target in the FOV that a shot can reach for at least Min Damage.", true, R),
+cb("april_rage_players", "Target Players", true, nil, R),
+cb("april_rage_npcs", "Target NPCs", true, nil, R),
+cb("april_rage_team_check", "Team Check", true, nil, R, { tip = "Never targets your party or clan members. The same team check the player ESP uses." }),
+sl("april_rage_fov", "FOV Radius", 10, 250, 125, false, R),
+sl("april_rage_max_dist", "Max Distance", 50, 2000, 800, false, R),
+combo("april_rage_priority", "Target Priority", { "Crosshair", "Closest" }, 0, R, { tip = "Crosshair: the target nearest your crosshair. Closest: the target nearest to you. Either way it has to be inside the FOV." }),
+cb("april_rage_autofire", "Auto Fire", true, nil, R, { tip = "Clicks every 5-10ms while a target can be hit, so your gun fires the moment it is ready. Every click checks again that the part is in plain sight, so it stops the instant the target is behind cover. Bows fire while you hold right click to draw. It only clicks while your cursor is over the game." }),
+cb("april_rage_reload_empty", "Reload When Empty", false, nil, R, { tip = "When Auto Fire keeps clicking and no bullet comes out, the magazine is empty: it presses R once and waits for the reload. Starts working once your gun has fired since you equipped it." }),
+cb("april_rage_draw_fov", "Show FOV Circle", false, { 1, 0.3, 0.3, 0.8 }, R),
+cb("april_rage_fill_fov", "Fill FOV", false, { 1, 0.3, 0.3, 0.25 }, R, { gate2 = "april_rage_draw_fov", tip = "Fills the FOV circle. Set the fill color and how see-through it is with the color box." }),
+cb("april_rage_indicator", "Show Target Info", true, nil, R, { tip = "Under the crosshair: the target, the hit part and the estimated damage, plus MIN DMG OVERRIDE while the override is on." }),
+},
+}
+local targeting = {
+title = "Ragebot Targeting",
+items = {
+{ type = "label", label = "Turn the Ragebot on to set hit parts and Min Damage.", dim = true, gate_off = R },
+combo("april_rage_part", "Hit Part", { "Head", "UpperTorso", "LowerTorso", "Closest", "Random" }, 0, R),
+I.multi("april_rage_parts", "Hit Parts", { "Head", "Upper Torso", "Lower Torso", "Left Arm", "Right Arm", "Left Leg", "Right Leg" }, { true, true, true, true, true, true, true }, R, { gate_any_combo = { { "april_rage_part", { 3, 4 } } }, tip = "Untick a part to never aim at it (Closest and Random). Every part is checked on its own: a hidden one is skipped for a part in plain sight." }),
+sl("april_rage_rand_head", "Head %", 0, 100, 40, false, R, { gate_combo = "april_rage_part", gate_combo_value = 4, gate_multi = { "april_rage_parts", 1, true } }),
+sl("april_rage_rand_upper", "Upper Torso %", 0, 100, 25, false, R, { gate_combo = "april_rage_part", gate_combo_value = 4, gate_multi = { "april_rage_parts", 2, true } }),
+sl("april_rage_rand_lower", "Lower Torso %", 0, 100, 15, false, R, { gate_combo = "april_rage_part", gate_combo_value = 4, gate_multi = { "april_rage_parts", 3, true } }),
+sl("april_rage_rand_larm", "Left Arm %", 0, 100, 5, false, R, { gate_combo = "april_rage_part", gate_combo_value = 4, gate_multi = { "april_rage_parts", 4, true } }),
+sl("april_rage_rand_rarm", "Right Arm %", 0, 100, 5, false, R, { gate_combo = "april_rage_part", gate_combo_value = 4, gate_multi = { "april_rage_parts", 5, true } }),
+sl("april_rage_rand_lleg", "Left Leg %", 0, 100, 5, false, R, { gate_combo = "april_rage_part", gate_combo_value = 4, gate_multi = { "april_rage_parts", 6, true } }),
+sl("april_rage_rand_rleg", "Right Leg %", 0, 100, 5, false, R, { gate_combo = "april_rage_part", gate_combo_value = 4, gate_multi = { "april_rage_parts", 7, true } }),
+{ type = "label", label = "How often each ticked part is picked. The ticked parts always add up to 100%.", dim = true, gate = R, gate_combo = "april_rage_part", gate_combo_value = 4 },
+cb("april_rage_multipoint", "Try Other Parts", true, nil, R, { gate_any_combo = { { "april_rage_part", { 0, 1, 2 } } }, tip = "If the fixed Hit Part is blocked or does too little damage, try the other body parts. Closest and Random always move on to another ticked part." }),
+sep(R),
+sl("april_rage_min_dmg", "Min Damage", 0, 150, 5, false, R, { tip = "Only shoot when one hit would do at least this much. The estimate counts the gun's damage and range dropoff, the hit part, your attachments and the target's armor." }),
+kb("april_rage_override", "Min Damage Override", false, R, { tip = "While active, Min Damage is replaced by Override Damage. Bind a key; it is a Hold key by default." }),
+sl("april_rage_override_dmg", "Override Damage", 0, 150, 10, false, R),
+},
+}
+local S = "april_silent_aim"
+local silent = {
+title = "Silent Aim",
+items = {
+cb(S, "Enable Silent Aim", false),
+I.label("Works while you hold left click.", true),
+cb("april_silent_players", "Target Players", true, nil, S),
+cb("april_silent_npcs", "Target NPCs", true, nil, S),
+cb("april_silent_team_check", "Team Check", true, nil, S, { tip = "Never targets your party or clan members. The same team check the player ESP uses." }),
+combo("april_silent_part", "Target Bone", { "Head", "UpperTorso", "LowerTorso", "Closest", "Random" }, 0, S),
+sl("april_silent_rand_head", "Head %", 0, 100, 50, false, S, { gate_combo = "april_silent_part", gate_combo_value = 4 }),
+sl("april_silent_rand_upper", "Upper Torso %", 0, 100, 30, false, S, { gate_combo = "april_silent_part", gate_combo_value = 4 }),
+sl("april_silent_rand_lower", "Lower Torso %", 0, 100, 20, false, S, { gate_combo = "april_silent_part", gate_combo_value = 4 }),
+{ type = "label", label = "The three always add up to 100%.", dim = true, gate = S, gate_combo = "april_silent_part", gate_combo_value = 4 },
+I.multi("april_silent_parts", "Hit Parts", { "Head", "Upper Torso", "Lower Torso" }, { true, true, true }, S, { gate_any_combo = { { "april_silent_part", { 3, 4 } } }, tip = "Untick a part to never aim at it (Closest and Random). In Random its share goes to the parts left ticked." }),
+sl("april_silent_hit_chance", "Hit Chance %", 0, 100, 70, false, S),
+sl("april_silent_fov", "FOV Radius", 10, 300, 80, false, S),
+sl("april_silent_max_dist", "Max Distance", 50, 1000, 300, false, S),
+cb("april_silent_visible_only", "Visible Only", true, nil, S),
+cb("april_silent_draw_fov", "Show FOV Circle", false, { 1, 0.4, 0.4, 0.8 }, S),
+cb("april_silent_fill_fov", "Fill FOV", false, { 1, 0.4, 0.4, 0.25 }, S, { gate2 = "april_silent_draw_fov", tip = "Fills the FOV circle. Set the fill color and how see-through it is with the color box." }),
+I.label("Uses the aimbot's lead and drop prediction. Stands aside while the ragebot has a target.", true, S),
+},
+}
+return { ragebot, targeting, silent }
+end
+return M
+end)()
+
 April._mods["menu.tabs"] = (function()
 local menu_util = April.require("core.menu_util")
 local debug = April.require("core.debug")
@@ -31345,11 +35304,11 @@ M._menu_registered = false
 M._update_dispatch = {}
 M._draw_dispatch = {}
 M.FEATURE_ORDER = {
-    "features.combat.camera_aimbot",
-    "features.combat.recoil_control",
     "features.visuals.target_overlay",
-    "features.visuals.target_visuals",
     "features.visuals.player_esp",
+    "features.visuals.esp_chams",
+    "features.visuals.bullet_tracers",
+    "features.visuals.hitsounds",
     "features.world.world_esp",
     "features.world.loot_esp",
     "features.world.npc_esp",
@@ -31357,10 +35316,11 @@ M.FEATURE_ORDER = {
     "features.world.base_esp",
     "features.world.base_xray",
     "features.radar.tactical_map",
-    "features.movement.desync",
-    "features.movement.anti_aim",
-    "features.movement.fake_duck",
-    "features.movement.fling",
+    "features.combat.aimbot",
+    "features.combat.ragebot",
+    "features.combat.silent_aim",
+    "features.combat.heli_aimbot",
+    "features.combat.recoil_control",
     "features.combat.perfect_farm",
     "features.utility.autofarm",
     "features.utility.mod_checker",
@@ -31573,10 +35533,7 @@ local ok, err = pcall(function()
     end
 
     April.require("core.api_aliases").apply()
-    April.require("features.movement.fling").install()
-    April.require("features.movement.anti_aim").install()
     April.require("features.world.base_xray").install()
-    April.require("features.movement.fake_duck").install()
 
     April._init_ok = true
 
@@ -31588,3 +35545,5 @@ end)
 if not ok then
     print("[April] Fatal: " .. tostring(err))
 end
+
+
