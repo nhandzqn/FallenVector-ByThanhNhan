@@ -6669,11 +6669,7 @@ local MENU_KEYS = {
     "april_aimbot_prediction", "april_aimbot_prediction_indicator", "april_aimbot_rand_head",
     "april_aimbot_rand_lower", "april_aimbot_rand_upper", "april_aimbot_smooth",
     "april_aimbot_sticky", "april_aimbot_visible_only",
-    "april_silent_aim",
-    "april_silent_draw_fov", "april_silent_fov", "april_silent_hit_chance",
-    "april_silent_max_dist", "april_silent_npcs", "april_silent_part", "april_silent_players",
-    "april_silent_rand_head", "april_silent_rand_lower", "april_silent_rand_upper",
-    "april_silent_visible_only", "april_aimbot_fill_fov",
+    "april_aimbot_fill_fov",
     "april_aimbot_parts", "april_aimbot_team_check",
     "april_btracer_enabled", "april_btracer_fade", "april_btracer_glow",
     "april_btracer_hit_color", "april_btracer_hits_only", "april_btracer_impact",
@@ -6683,14 +6679,13 @@ local MENU_KEYS = {
     "april_hitsound_enabled", "april_hitsound_head", "april_hitsound_npcs",
     "april_hitsound_refresh", "april_hitsound_test_body", "april_hitsound_test_head",
     "april_rage_autofire", "april_rage_draw_fov",
-    "april_rage_enabled", "april_rage_fill_fov", "april_rage_fov", "april_rage_indicator",
+    "april_rage_enabled", "april_rage_fill_fov", "april_rage_fov", "april_rage_indicator", "april_rage_magic",
     "april_rage_max_dist", "april_rage_min_dmg", "april_rage_multipoint", "april_rage_npcs",
     "april_rage_override", "april_rage_override_dmg", "april_rage_part", "april_rage_parts",
     "april_rage_players", "april_rage_priority", "april_rage_rand_head",
     "april_rage_rand_larm", "april_rage_rand_lleg", "april_rage_rand_lower",
     "april_rage_rand_rarm", "april_rage_rand_rleg", "april_rage_rand_upper",
-    "april_rage_reload_empty", "april_rage_shot", "april_rage_team_check",
-    "april_silent_fill_fov", "april_silent_parts", "april_silent_team_check",
+    "april_rage_reload_empty", "april_rage_team_check",
 
     "april_aim_whitelist", "april_player_chams", "april_player_chams_type",
     "april_player_chams_mode", "april_player_chams_preset", "april_player_chams_style",
@@ -6743,8 +6738,6 @@ local COLOR_KEYS = {
     "april_aimbot_auto_weapon_indicator", "april_aimbot_draw_fov",
     "april_aimbot_drop_prediction_indicator", "april_aimbot_prediction_indicator",
     "april_aimbot_fill_fov",
-    "april_silent_draw_fov",
-    "april_silent_fill_fov",
     "april_rage_draw_fov", "april_rage_fill_fov",
 
     "april_player_chams_color", "april_npc_chams_color", "april_btracer_hit_color",
@@ -6776,7 +6769,6 @@ local HOTKEY_KEYS = {
     "april_aim_key",
     "april_ui_menu_key",
     "april_aimbot_key", "april_aimbot_npcs_key", "april_aimbot_players_key",
-    "april_silent_aim",
 
     "april_heli_aim_key",
 
@@ -7645,13 +7637,13 @@ april_aimbot_rand_upper=30
 april_aimbot_smooth=1
 april_aimbot_sticky=true
 april_aimbot_visible_only=false
-april_silent_aim=false
 april_aimbot_fill_fov=false
 april_aimbot_parts=1,1,1
 april_aimbot_team_check=true
 april_btracer_enabled=false
 april_hitsound_enabled=false
 april_rage_enabled=false
+april_rage_magic=true
 april_rage_override=false
 april_aim_whitelist=false
 april_player_chams=false
@@ -7790,8 +7782,6 @@ april_target_overlay_hide_kb=false
 @color:april_aimbot_drop_prediction_indicator=1,0.5,0,1
 @color:april_aimbot_prediction_indicator=0,1,1,1
 @color:april_aimbot_fill_fov=1,1,1,0.25
-@color:april_silent_draw_fov=1,1,1,1
-@color:april_silent_fill_fov=1,1,1,1
 @color:april_rage_draw_fov=1,1,1,1
 @color:april_rage_fill_fov=1,1,1,1
 @color:april_player_chams_color=1,1,1,1
@@ -7819,7 +7809,6 @@ april_target_overlay_hide_kb=false
 @key:april_rage_override=0
 @key:april_raid_enabled=107
 @key:april_rcs_enabled=0
-@key:april_silent_aim=0
 @key:april_target_overlay=0
 @key:april_ui_menu_key=163
 @key:april_world_enabled=97
@@ -26115,7 +26104,6 @@ local STRINGS_VI = {
     ["MAP"] = "BẢN ĐỒ",
     ["Made by ThanhNhan"] = "ThanhNhan tạo",
     ["Magenta"] = "Hồng sen",
-    ["Magic Bullet: the shot starts right in front of the part and can't miss. Silent Aim: the shot goes from your camera straight at the part. Neither leads the target, and both only shoot parts in plain sight."] = "Magic Bullet: đạn xuất phát ngay trước bộ phận và không thể trượt. Silent Aim: đạn đi từ camera thẳng tới bộ phận. Cả hai không bắn đón và chỉ bắn bộ phận nhìn thấy rõ.",
     ["Main Accent"] = "Màu nhấn chính",
     ["Manual"] = "Thủ công",
     ["Manual Farm Helper"] = "Hỗ trợ farm thủ công",
@@ -26496,7 +26484,6 @@ local STRINGS_VI = {
     ["Display Time (s)"] = "Thời gian hiện (s)",
     ["Enable Heli Aimbot"] = "Bật Aimbot trực thăng",
     ["Enable Mesh Chams"] = "Bật chams lưới",
-    ["Enable Silent Aim"] = "Bật Silent Aim",
     ["Engine (like ahook)"] = "Engine (như ahook)",
     ["Event Notifications"] = "Thông báo sự kiện",
     ["Event Sorting"] = "Sắp xếp sự kiện",
@@ -26551,18 +26538,16 @@ local STRINGS_VI = {
     ["RAGE"] = "RAGE",
     ["Radar Detail"] = "Chi tiết radar",
     ["Radar Filters"] = "Bộ lọc radar",
-    ["Ragebot"] = "Ragebot",
-    ["Ragebot Targeting"] = "Ngắm Ragebot",
+    ["Silent Aim"] = "Silent Aim",
+    ["Silent Aim Targeting"] = "Ngắm Silent Aim",
     ["Refresh Sound List"] = "Làm mới danh sách âm",
     ["Reload When Empty"] = "Tự nạp khi hết đạn",
     ["Ring"] = "Vòng",
     ["Screen Offset"] = "Lệch màn hình",
-    ["Shot Mode"] = "Kiểu bắn",
     ["Show Event Distance"] = "Hiện khoảng cách sự kiện",
     ["Show Event Health"] = "Hiện máu sự kiện",
     ["Show FOV Circle"] = "Hiện vòng FOV",
     ["Show Target Info"] = "Hiện thông tin mục tiêu",
-    ["Silent Aim"] = "Silent Aim",
     ["Skip Teammates"] = "Bỏ qua đồng đội",
     ["Smooth"] = "Mượt",
     ["Smoothing"] = "Độ mượt",
@@ -29819,7 +29804,7 @@ end)()
 April._mods["ui.catalog"] = (function()
 local M = {}
 M.TABS = {
-{ id = "rage", icon = "skull", title = "RAGE", label = "RAGE", description = "Ragebot and silent aim" },
+{ id = "rage", icon = "skull", title = "RAGE", label = "RAGE", description = "Silent Aim" },
 { id = "aim", icon = "aim", title = "Combat", label = "Aim", description = "Targeting and aim behavior" },
 { id = "visuals", icon = "visuals", title = "Visuals", label = "Visuals", description = "Player information and gear" },
 { id = "world", icon = "world", title = "World", label = "World", description = "Resources, loot, NPCs, raids, and bases" },
@@ -31515,7 +31500,7 @@ return M
 end)()
 
 April._mods["core.silent_hook"] = (function()
--- One shared switch for Vector's raycast hook, used by silent aim and the ragebot: the hook
+-- One shared switch for Vector's raycast hook, used by the ragebot: the hook
 -- stays on while either wants it, and only the feature that last pointed the shot can clear
 -- it. M.last records where shots are being sent (bullet tracers read it).
 local notify = April.require("core.notify")
@@ -31959,7 +31944,7 @@ April._mods["game.shots"] = (function()
 -- Your own shots, shared by bullet tracers and hitsounds. A shot is noticed when Fallen puts its
 -- bullet effect (ShotTracer, RifleBullet, arrows...) beside your camera, or, if no effect shows
 -- up, when you click with a gun out. Each shot is resolved once: where it went (toward the
--- silent aim / ragebot target when one of them is pointing the shot, otherwise along your
+-- ragebot target when it is pointing the shot, otherwise along your
 -- crosshair), whether it ended on a character, and whether that was the head. Every feature
 -- that subscribed gets its own copy of each shot.
 local env = April.require("core.env")
@@ -33132,7 +33117,7 @@ local function text_w(text, size)
     local ok, w = pcall(fn, text, size)
     return ok and tonumber(w) or 0
 end
--- Hit part profiles: the aimbot and silent aim each have their own Target Bone setting and
+-- Hit part profiles: the aimbot and ragebot each have their own Target Bone setting and
 -- their own Random percentages.
 -- Random hit part: the three percentage sliders always add up to 100. When you move one,
 -- the other two share what is left in the same ratio they had (evenly if both were 0).
@@ -33142,9 +33127,6 @@ local function new_profile(combo_id, ids, parts_id)
 end
 local AIM_PROFILE = new_profile("april_aimbot_bone", RAND_IDS, "april_aimbot_parts")
 M.AIM_PROFILE = AIM_PROFILE
-M.SILENT_PROFILE = new_profile("april_silent_part", {
-    "april_silent_rand_head", "april_silent_rand_upper", "april_silent_rand_lower",
-}, "april_silent_parts")
 M.RAGE_PROFILE = new_profile("april_rage_part", {
     "april_rage_rand_head", "april_rage_rand_upper", "april_rage_rand_lower",
 }, "april_rage_parts")
@@ -33355,7 +33337,7 @@ end
 function M.is_visible(target, cx, cy, cz, px, py, pz)
     return is_visible(target, cx, cy, cz, px, py, pz)
 end
--- Player and NPC targets are refreshed every 250ms while the aimbot or silent aim needs them.
+-- Player and NPC targets are refreshed every 250ms while the aimbot or ragebot needs them.
 function M.ensure_scan()
     local now = now_ms()
     if now - last_target_scan >= TARGET_SCAN_MS then
@@ -33423,7 +33405,6 @@ end
 function M.update(_dt)
     handle_keybind_toggles()
     pcall(M.balance_random, AIM_PROFILE)
-    pcall(M.balance_random, M.SILENT_PROFILE)
     if not settings.bool("april_aimbot_enabled", false) then return end
     M.ensure_scan()
     handle_whitelist_toggle()
@@ -33617,133 +33598,14 @@ end
 return M
 end)()
 
-April._mods["features.combat.silent_aim"] = (function()
--- Silent aim through Vector's raycast hook: while you hold left click, the game's aim ray
--- is pointed at the predicted spot on the target (same lead and drop as the aimbot) and the
--- camera does not move. It only acts while you fire, only on targets inside its FOV and
--- range, only on visible targets by default, and only on the share of shots set by Hit
--- Chance. While the ragebot has a target it owns the shot and silent aim stands aside.
-local settings = April.require("core.settings")
-local draw_util = April.require("core.draw_util")
-local silent_hook = April.require("core.silent_hook")
-local M = {}
-local P = "april_silent_aim"
-local OWNER = "silent_aim"
-local LMB = 0x01
-local locked = nil
-local roll = { ok = true, next_at = 0, lmb = false, target = nil }
-local function now_ms()
-    local fn = utility and (utility.get_tick_count or utility.GetTickCount)
-    if type(fn) ~= "function" then return 0 end
-    local ok, v = pcall(fn)
-    return ok and tonumber(v) or 0
-end
-local function key_down(vk)
-    local fn = input and (input.is_key_down or input.IsKeyDown)
-    if type(fn) ~= "function" then return false end
-    local ok, v = pcall(fn, vk)
-    return ok and v == true
-end
-local function menu_open()
-    local ok, ui = pcall(function() return April.require("ui.custom_menu") end)
-    return ok and ui and ui.is_open and ui.is_open() == true
-end
-local function rage_busy()
-    local ok, rage = pcall(April.require, "features.combat.ragebot")
-    return ok and rage and rage.has_target and rage.has_target() == true
-end
--- One hit-chance roll per click and every 0.12-0.22s while held, so with 70% about 7 in
--- 10 shots are redirected and the rest go where you actually aimed.
-local function update_roll(target)
-    local now = now_ms()
-    local lmb = key_down(LMB)
-    if roll.target ~= target or (not lmb and roll.lmb) or (lmb and now >= roll.next_at) then
-        local chance = math.max(0, math.min(100, settings.num("april_silent_hit_chance", 70)))
-        roll.ok = math.random() * 100 < chance
-        roll.next_at = now + 120 + math.random() * 100
-    end
-    roll.lmb = lmb
-    roll.target = target
-end
-function M.update(_dt)
-    if settings.bool(P, false) then
-        April.require("features.combat.aimbot").ensure_scan()
-    end
-end
-function M.draw()
-    if not settings.bool(P, false) then
-        locked = nil
-        roll.target = nil
-        roll.next_at = 0
-        M._screen_target = nil
-        silent_hook.release(OWNER)
-        return
-    end
-    if not silent_hook.acquire(OWNER) then return end
-    local aimbot = April.require("features.combat.aimbot")
-    local sw, sh = draw_util.screen_size()
-    local scx, scy = sw * 0.5, sh * 0.5
-    local fov = settings.num("april_silent_fov", 80)
-    if settings.bool("april_silent_draw_fov", false) then
-        draw_util.fill_fov("april_silent_fill_fov", scx, scy, fov, { 1, 0.4, 0.4, 0.25 })
-        local circle = draw and (draw.circle or draw.Circle)
-        if circle then
-            pcall(circle, scx, scy, fov, settings.color("april_silent_draw_fov", { 1, 0.4, 0.4, 0.8 }), 64)
-        end
-    end
-    if menu_open() or rage_busy() then
-        silent_hook.stop(OWNER)
-        return
-    end
-    local w2s = April.require("core.esp_util").w2s
-    if type(w2s) ~= "function" then return end
-    local targets = aimbot.targets(settings.bool("april_silent_players", true), settings.bool("april_silent_npcs", true),
-        settings.bool("april_silent_team_check", true))
-    local max_dist = settings.num("april_silent_max_dist", 300)
-    local visible_only = settings.bool("april_silent_visible_only", true)
-    local pf = aimbot.SILENT_PROFILE
-    local bone_mode = settings.num(pf.combo, 0)
-    aimbot.update_random(locked, pf)
-    local ctx = aimbot.make_ctx()
-    local best, best_d, best_t = nil, fov, nil
-    for i = 1, #targets do
-        local t = targets[i]
-        if aimbot.is_target_valid(t) then
-            local pos = aimbot.aim_point(t, aimbot.choose_bone(t, bone_mode, scx, scy, pf), ctx)
-            if pos and pos.dist <= max_dist then
-                local sx, sy, vis = w2s(pos.x, pos.y, pos.z)
-                if vis then
-                    local dx, dy = sx - scx, sy - scy
-                    local d = math.sqrt(dx * dx + dy * dy)
-                    if d < best_d and (not visible_only
-                        or aimbot.is_visible(t, ctx.cx, ctx.cy, ctx.cz, pos.rx, pos.ry, pos.rz)) then
-                        best, best_d, best_t = pos, d, t
-                        M._screen_target = { x = sx, y = sy, t = now_ms() }
-                    end
-                end
-            end
-        end
-    end
-    locked = best_t
-    update_roll(best_t)
-    if not best or not roll.ok then
-        silent_hook.stop(OWNER)
-        return
-    end
-    silent_hook.track(OWNER, { x = ctx.cx, y = ctx.cy, z = ctx.cz },
-        { x = best.x - ctx.cx, y = best.y - ctx.cy, z = best.z - ctx.cz }, LMB,
-        { part = best.bone, model = best_t and best_t.obj })
-end
-return M
-end)()
-
 April._mods["features.combat.ragebot"] = (function()
--- Ragebot: every frame it looks for a target part inside its FOV that a shot can really hit (in
--- plain sight, a clear path from the camera along the bullet's curve, inside the gun's range, not
--- downed) and that one hit would do at least Min Damage to. The shot goes there by magic bullet:
--- its ray starts just in front of the part, on that clear line, and runs into it. With Auto Fire it
--- also pulls the trigger. Hit Part works like the aimbot's Target Bone (same Random percentages);
--- a hidden or weak part makes it move on to another one.
+-- Silent Aim (the ragebot): every frame it looks for a target part inside its FOV that a shot can
+-- really hit (in plain sight, a clear path from the camera along the bullet's curve, inside the
+-- gun's range, not downed) and that one hit would do at least Min Damage to. With Magic Bullet on,
+-- the shot's ray starts just in front of the part, on that clear line, and runs into it; with it
+-- off, the ray goes from the camera straight at the part. With Auto Fire it also pulls the trigger.
+-- Hit Part works like the aimbot's Target Bone (same Random percentages); a hidden or weak part
+-- makes it move on to another one.
 local settings = April.require("core.settings")
 local draw_util = April.require("core.draw_util")
 local menu_util = April.require("core.menu_util")
@@ -33846,7 +33708,7 @@ local function shuffle(list)
     end
     return list
 end
--- Ragebot hit parts. A limb is aimed at through whichever of its pieces (upper, lower, hand or
+-- Silent Aim hit parts. A limb is aimed at through whichever of its pieces (upper, lower, hand or
 -- foot, or the R6 limb) can be hit; each piece gets its own sight and path check.
 M.GROUPS = {
     { label = "Head", rand = "april_rage_rand_head", weight = 40, parts = { "Head" } },
@@ -34607,7 +34469,6 @@ end
 -- camera that was just checked clear, and runs MAGIC_PAST studs into it, so spread, recoil, drop or
 -- travel time can't make it miss.
 local MAGIC_BACK, MAGIC_PAST, MAGIC_LEAD = 2.5, 3, 0.5
-M.SHOT_MAGIC, M.SHOT_SILENT = 0, 1
 local function magic_ray(ctx, pick)
     local px, py, pz = pick.pos.rx, pick.pos.ry, pick.pos.rz
     local dx, dy, dz = px - ctx.cx, py - ctx.cy, pz - ctx.cz
@@ -34626,19 +34487,19 @@ local function magic_ray(ctx, pick)
     return { x = px - ux * back, y = py - uy * back, z = pz - uz * back }, { x = ux * reach, y = uy * reach, z = uz * reach }
 end
 M.magic_ray = magic_ray
--- Silent Aim: the shot's ray from your camera straight at the part (no lead).
+-- Magic Bullet off: the shot's ray goes from your camera straight at the part, with no lead.
 local function silent_ray(ctx, pick)
     local px, py, pz = pick.pos.rx, pick.pos.ry, pick.pos.rz
     local dx, dy, dz = px - ctx.cx, py - ctx.cy, pz - ctx.cz
     if dx * dx + dy * dy + dz * dz < 1e-4 then return nil end
     return { x = ctx.cx, y = ctx.cy, z = ctx.cz }, { x = dx, y = dy, z = dz }
 end
-function M.shot_mode()
-    return settings.num("april_rage_shot", M.SHOT_MAGIC) == M.SHOT_SILENT and M.SHOT_SILENT or M.SHOT_MAGIC
+function M.magic_enabled()
+    return settings.bool("april_rage_magic", true)
 end
 local function shot_ray(ctx, pick)
-    if M.shot_mode() == M.SHOT_SILENT then return silent_ray(ctx, pick) end
-    return magic_ray(ctx, pick)
+    if M.magic_enabled() then return magic_ray(ctx, pick) end
+    return silent_ray(ctx, pick)
 end
 M.shot_ray = shot_ray
 local function target_name(t)
@@ -34681,7 +34542,7 @@ end
 function M.register_menu()
     local G = menu_util.G
     local T = menu_util.group(G.MISC)
-    menu_util.register_keybind(T, G.MISC, P, "Ragebot", false)
+    menu_util.register_keybind(T, G.MISC, P, "Silent Aim", false)
     menu_util.register_keybind(T, G.MISC, P_OVERRIDE, "Min Damage Override", false, { default_mode = 1 })
 end
 function M.update(_dt)
@@ -34735,7 +34596,7 @@ function M.draw()
     end
     local aimbot = April.require("features.combat.aimbot")
     local ctx = aimbot.make_ctx()
-    -- neither shot mode leads the target; the drop stays in the path check
+    -- the shot does not lead the target; the drop stays in the path check
     ctx.prediction, ctx.drop = false, true
     local pick = M.find(aimbot, ctx, weapon, w2s, scx, scy)
     state.pick, state.ctx = pick, ctx
@@ -34747,7 +34608,7 @@ function M.draw()
         draw_status(scx, scy, nil)
         return
     end
-    -- the shot (magic bullet or silent aim, through the silent hook): shots fired while left
+    -- the shot (magic bullet or camera ray, through the silent hook): shots fired while left
     -- click is held go to the pick
     -- your own left click is a shot too: its part was this frame's roll, the next one rolls again
     local lmb = key_down(LMB)
@@ -35219,10 +35080,10 @@ local M = {}
 function M.build()
 local R = "april_rage_enabled"
 local ragebot = {
-title = "Ragebot",
+title = "Silent Aim",
 items = {
-kb(R, "Ragebot", false, nil, { tip = "Finds a target part in the FOV that's in plain sight and that a shot can really reach for at least Min Damage, sends the shot there, and with Auto Fire pulls the trigger for you." }),
-combo("april_rage_shot", "Shot Mode", { "Magic Bullet", "Silent Aim" }, 0, R, { tip = "Magic Bullet: the shot starts right in front of the part and can't miss. Silent Aim: the shot goes from your camera straight at the part. Neither leads the target, and both only shoot parts in plain sight." }),
+kb(R, "Silent Aim", false, nil, { tip = "Finds a target part in the FOV that's in plain sight and that a shot can really reach for at least Min Damage, sends the shot there, and with Auto Fire pulls the trigger for you." }),
+cb("april_rage_magic", "Magic Bullet", true, nil, R, { tip = "On: the shot starts just in front of the part and runs into it, so spread, recoil, drop and travel time can't make it miss. Off: the shot goes from your camera straight at the part." }),
 I.label("Shoots any target in the FOV that a shot can reach for at least Min Damage.", true, R),
 cb("april_rage_players", "Target Players", true, nil, R),
 cb("april_rage_npcs", "Target NPCs", true, nil, R),
@@ -35238,9 +35099,9 @@ cb("april_rage_indicator", "Show Target Info", true, nil, R, { tip = "Under the 
 },
 }
 local targeting = {
-title = "Ragebot Targeting",
+title = "Silent Aim Targeting",
 items = {
-{ type = "label", label = "Turn the Ragebot on to set hit parts and Min Damage.", dim = true, gate_off = R },
+{ type = "label", label = "Turn Silent Aim on to set hit parts and Min Damage.", dim = true, gate_off = R },
 combo("april_rage_part", "Hit Part", { "Head", "UpperTorso", "LowerTorso", "Closest", "Random" }, 0, R),
 I.multi("april_rage_parts", "Hit Parts", { "Head", "Upper Torso", "Lower Torso", "Left Arm", "Right Arm", "Left Leg", "Right Leg" }, { true, true, true, true, true, true, true }, R, { gate_any_combo = { { "april_rage_part", { 3, 4 } } }, tip = "Untick a part to never aim at it (Closest and Random). Every part is checked on its own: a hidden one is skipped for a part in plain sight." }),
 sl("april_rage_rand_head", "Head %", 0, 100, 40, false, R, { gate_combo = "april_rage_part", gate_combo_value = 4, gate_multi = { "april_rage_parts", 1, true } }),
@@ -35258,31 +35119,7 @@ kb("april_rage_override", "Min Damage Override", false, R, { tip = "While active
 sl("april_rage_override_dmg", "Override Damage", 0, 150, 10, false, R),
 },
 }
-local S = "april_silent_aim"
-local silent = {
-title = "Silent Aim",
-items = {
-cb(S, "Enable Silent Aim", false),
-I.label("Works while you hold left click.", true),
-cb("april_silent_players", "Target Players", true, nil, S),
-cb("april_silent_npcs", "Target NPCs", true, nil, S),
-cb("april_silent_team_check", "Team Check", true, nil, S, { tip = "Never targets your party or clan members. The same team check the player ESP uses." }),
-combo("april_silent_part", "Target Bone", { "Head", "UpperTorso", "LowerTorso", "Closest", "Random" }, 0, S),
-sl("april_silent_rand_head", "Head %", 0, 100, 50, false, S, { gate_combo = "april_silent_part", gate_combo_value = 4 }),
-sl("april_silent_rand_upper", "Upper Torso %", 0, 100, 30, false, S, { gate_combo = "april_silent_part", gate_combo_value = 4 }),
-sl("april_silent_rand_lower", "Lower Torso %", 0, 100, 20, false, S, { gate_combo = "april_silent_part", gate_combo_value = 4 }),
-{ type = "label", label = "The three always add up to 100%.", dim = true, gate = S, gate_combo = "april_silent_part", gate_combo_value = 4 },
-I.multi("april_silent_parts", "Hit Parts", { "Head", "Upper Torso", "Lower Torso" }, { true, true, true }, S, { gate_any_combo = { { "april_silent_part", { 3, 4 } } }, tip = "Untick a part to never aim at it (Closest and Random). In Random its share goes to the parts left ticked." }),
-sl("april_silent_hit_chance", "Hit Chance %", 0, 100, 70, false, S),
-sl("april_silent_fov", "FOV Radius", 10, 300, 80, false, S),
-sl("april_silent_max_dist", "Max Distance", 50, 1000, 300, false, S),
-cb("april_silent_visible_only", "Visible Only", true, nil, S),
-cb("april_silent_draw_fov", "Show FOV Circle", false, { 1, 0.4, 0.4, 0.8 }, S),
-cb("april_silent_fill_fov", "Fill FOV", false, { 1, 0.4, 0.4, 0.25 }, S, { gate2 = "april_silent_draw_fov", tip = "Fills the FOV circle. Set the fill color and how see-through it is with the color box." }),
-I.label("Uses the aimbot's lead and drop prediction. Stands aside while the ragebot has a target.", true, S),
-},
-}
-return { ragebot, targeting, silent }
+return { ragebot, targeting }
 end
 return M
 end)()
@@ -35318,7 +35155,6 @@ M.FEATURE_ORDER = {
     "features.radar.tactical_map",
     "features.combat.aimbot",
     "features.combat.ragebot",
-    "features.combat.silent_aim",
     "features.combat.heli_aimbot",
     "features.combat.recoil_control",
     "features.combat.perfect_farm",
